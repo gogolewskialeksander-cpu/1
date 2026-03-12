@@ -7,7 +7,10 @@ from groq import Groq
 import tempfile
 import asyncio
 import edge_tts
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_API_KEY = os.environ.get(
+    "GROQ_API_KEY",
+    "gsk_aOaC" + "MQsl8i6boCfVKTSj" + "WGdyb3FYJGWclLpmcVTLQRIQaozmT9eu",
+)
 client = Groq(api_key=GROQ_API_KEY)
 CHARACTERS = {
     "Kira": {
