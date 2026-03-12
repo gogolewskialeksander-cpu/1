@@ -4,16 +4,13 @@
 import os
 import base64
 import streamlit as st
-from openai import OpenAI
+import requests
 import tempfile
 import asyncio
 import edge_tts
 
+POLLINATIONS_URL = "https://gen.pollinations.ai/v1/chat/completions"
 POLLINATIONS_API_KEY = "pk_ugZeurEhJnFhFLAB"
-client = OpenAI(
-    base_url="https://gen.pollinations.ai/v1",
-    api_key=POLLINATIONS_API_KEY,
-)
 
 IMG_FOLDER = r"C:\Users\Olek\Desktop\chatbot"
 
@@ -136,14 +133,20 @@ def build_messages(history, wulgarnosc, char_name):
 
 def generate_response(history, wulgarnosc, char_name):
     messages = build_messages(history, wulgarnosc, char_name)
-    response = client.chat.completions.create(
-        model="openai",
-        messages=messages,
-        temperature=0.85,
-        max_tokens=100,
-        top_p=0.9,
-    )
-    return response.choices[0].message.content.strip()
+    headers = {
+        "Authorization": f"Bearer {POLLINATIONS_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    data = {
+        "model": "openai",
+        "messages": messages,
+        "temperature": 0.85,
+        "max_tokens": 100,
+        "top_p": 0.9,
+    }
+    resp = requests.post(POLLINATIONS_URL, json=data, headers=headers, timeout=30)
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"].strip()
 
 
 def generate_voice(text, char_name):
