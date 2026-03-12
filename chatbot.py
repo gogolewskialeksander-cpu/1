@@ -10,9 +10,14 @@ import asyncio
 import edge_tts
 
 POLLINATIONS_URL = "https://gen.pollinations.ai/v1/chat/completions"
-POLLINATIONS_API_KEY = "pk_ugZeurEhJnFhFLAB"
 
-IMG_FOLDER = r"C:\Users\Olek\Desktop\chatbot"
+# Folder ze zdjeciami - probuj kilka lokalizacji
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+IMG_FOLDER_CANDIDATES = [
+    r"C:\Users\Olek\Desktop\chatbot",
+    os.path.join(_script_dir, "chatbot"),
+    _script_dir,
+]
 
 CHARACTERS = {
     "Kira": {
@@ -90,13 +95,16 @@ CHARACTERS = {
 def get_img_base64(char_name):
     """Load character image as base64 for HTML embedding."""
     char = CHARACTERS[char_name]
-    img_path = os.path.join(IMG_FOLDER, char["img_file"])
-    try:
-        with open(img_path, "rb") as f:
-            data = base64.b64encode(f.read()).decode()
-        return f"data:image/jpeg;base64,{data}"
-    except Exception:
-        return ""
+    for folder in IMG_FOLDER_CANDIDATES:
+        img_path = os.path.join(folder, char["img_file"])
+        if os.path.isfile(img_path):
+            try:
+                with open(img_path, "rb") as f:
+                    data = base64.b64encode(f.read()).decode()
+                return f"data:image/jpeg;base64,{data}"
+            except Exception:
+                continue
+    return ""
 
 
 def build_messages(history, wulgarnosc, char_name):
@@ -134,7 +142,6 @@ def build_messages(history, wulgarnosc, char_name):
 def generate_response(history, wulgarnosc, char_name):
     messages = build_messages(history, wulgarnosc, char_name)
     headers = {
-        "Authorization": f"Bearer {POLLINATIONS_API_KEY}",
         "Content-Type": "application/json",
     }
     data = {
