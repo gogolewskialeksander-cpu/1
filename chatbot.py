@@ -2,7 +2,6 @@
 # Krotkie wiadomosci, Pollinations API, zdjecia profilowe, glos
 # Uzycie: py -3.11 -m streamlit run chatbot.py
 import os
-import base64
 import streamlit as st
 import requests
 import tempfile
@@ -92,19 +91,14 @@ CHARACTERS = {
 }
 
 
-def get_img_base64(char_name):
-    """Load character image as base64 for HTML embedding."""
+def get_img_path(char_name):
+    """Find character image file path."""
     char = CHARACTERS[char_name]
     for folder in IMG_FOLDER_CANDIDATES:
         img_path = os.path.join(folder, char["img_file"])
         if os.path.isfile(img_path):
-            try:
-                with open(img_path, "rb") as f:
-                    data = base64.b64encode(f.read()).decode()
-                return f"data:image/jpeg;base64,{data}"
-            except Exception:
-                continue
-    return ""
+            return img_path
+    return None
 
 
 def build_messages(history, wulgarnosc, char_name):
@@ -342,59 +336,45 @@ section[data-testid="stMainBlockContainer"] {
 
 /* ===== MESSENGER CHAT LAYOUT ===== */
 
-/* Ukryj domyslne Streamlit chat messages */
+/* Styl wiadomosci - Messenger look */
 .stChatMessage {
-    display: none !important;
+    background-color: transparent !important;
+    border: none !important;
+    padding: 4px 10px !important;
+    margin: 2px 0 !important;
+    border-radius: 0 !important;
 }
 
-.messenger-container {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    padding: 10px 0;
+/* Dymki wiadomosci */
+.stChatMessage [data-testid="stMarkdownContainer"] p {
+    padding: 10px 16px;
+    border-radius: 18px;
+    font-size: 0.95em !important;
+    line-height: 1.5 !important;
+    display: inline-block;
+    max-width: 85%;
 }
 
-/* Wiadomosc bota - lewa strona */
-.msg-bot {
-    display: flex;
-    align-items: flex-end;
-    gap: 8px;
-    max-width: 75%;
-    align-self: flex-start;
-}
-.msg-bot-avatar {
-    width: 32px;
-    height: 32px;
-    border-radius: 50%;
-    object-fit: cover;
-    flex-shrink: 0;
-}
-.msg-bot-bubble {
+/* Bot - lewa strona, ciemny fiolet */
+.stChatMessage[data-testid="stChatMessage-assistant"] [data-testid="stMarkdownContainer"] p {
     background: linear-gradient(135deg, #2a1a2e, #1e1028);
     color: #e8e0f0 !important;
-    padding: 10px 16px;
     border-radius: 18px 18px 18px 4px;
-    font-size: 0.95em;
-    line-height: 1.5;
     border: 1px solid rgba(255,23,68,0.12);
-    word-wrap: break-word;
 }
 
-/* Wiadomosc usera - prawa strona */
-.msg-user {
-    display: flex;
-    justify-content: flex-end;
-    max-width: 75%;
-    align-self: flex-end;
-}
-.msg-user-bubble {
+/* User - prawa strona, szary */
+.stChatMessage[data-testid="stChatMessage-user"] [data-testid="stMarkdownContainer"] p {
     background: #303030;
     color: #ffffff !important;
-    padding: 10px 16px;
     border-radius: 18px 18px 4px 18px;
-    font-size: 0.95em;
-    line-height: 1.5;
-    word-wrap: break-word;
+}
+
+/* Avatar - okragly */
+.stChatMessage [data-testid="stChatMessageAvatarCustom"] img,
+.stChatMessage img[data-testid] {
+    border-radius: 50% !important;
+    object-fit: cover !important;
 }
 
 /* Chat header */
@@ -503,27 +483,6 @@ audio {
 """
 
 
-def render_messages(messages, char_name, avatar_b64):
-    """Render all messages as Messenger-style HTML bubbles."""
-    html = '<div class="messenger-container">'
-    for msg in messages:
-        if msg["role"] == "user":
-            html += f'''
-            <div class="msg-user">
-                <div class="msg-user-bubble">{msg["content"]}</div>
-            </div>'''
-        else:
-            if avatar_b64:
-                avatar_html = f'<img class="msg-bot-avatar" src="{avatar_b64}">'
-            else:
-                avatar_html = f'<div class="msg-bot-avatar" style="background:{CHARACTERS[char_name]["gradient"]};display:flex;align-items:center;justify-content:center;font-size:0.8em;">{CHARACTERS[char_name]["emoji"]}</div>'
-            html += f'''
-            <div class="msg-bot">
-                {avatar_html}
-                <div class="msg-bot-bubble">{msg["content"]}</div>
-            </div>'''
-    html += '</div>'
-    return html
 
 
 def show_character_select():
@@ -534,15 +493,11 @@ def show_character_select():
     cols = st.columns(2)
     for i, (name, char) in enumerate(CHARACTERS.items()):
         with cols[i % 2]:
-            img_b64 = get_img_base64(name)
-            if img_b64:
-                avatar_html = f'<img class="char-avatar-img" src="{img_b64}">'
-            else:
-                avatar_html = f'<div class="char-avatar" style="background: {char["gradient"]};">{char["emoji"]}</div>'
-
+            img_path = get_img_path(name)
+            if img_path:
+                st.image(img_path, use_container_width=False, width=120)
             st.markdown(f"""
             <div class="char-card">
-                {avatar_html}
                 <div class="char-name">{name}</div>
                 <div class="char-age">{char['age']} lat</div>
                 <div class="char-desc">{char['desc']}</div>
@@ -558,11 +513,13 @@ def show_character_select():
 def show_chat():
     char_name = st.session_state.selected_char
     char = CHARACTERS[char_name]
-    avatar_b64 = get_img_base64(char_name)
+    img_path = get_img_path(char_name)
 
     st.markdown(CSS, unsafe_allow_html=True)
 
     # Sidebar
+    if img_path:
+        st.sidebar.image(img_path, width=80)
     st.sidebar.markdown(f"### {char['emoji']} {char_name}")
     st.sidebar.markdown(f"*{char['desc']}*")
     st.sidebar.divider()
@@ -577,15 +534,13 @@ def show_chat():
         st.session_state.messages = []
         st.rerun()
 
-    # Chat header z obrazkiem
-    if avatar_b64:
-        header_img = f'<img class="chat-header-img" src="{avatar_b64}">'
-    else:
-        header_img = f'<div style="font-size:2.5em;display:inline-block;">{char["emoji"]}</div>'
-
+    # Chat header
+    if img_path:
+        col1, col2, col3 = st.columns([1, 1, 1])
+        with col2:
+            st.image(img_path, width=80)
     st.markdown(f"""
     <div class="chat-header">
-        {header_img}
         <div class="chat-header-name">{char_name}</div>
         <div class="chat-header-status">Online teraz</div>
     </div>
@@ -594,12 +549,15 @@ def show_chat():
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # Renderuj wiadomosci jako Messenger bubbles
-    if st.session_state.messages:
-        st.markdown(
-            render_messages(st.session_state.messages, char_name, avatar_b64),
-            unsafe_allow_html=True,
-        )
+    # Renderuj wiadomosci - st.chat_message z avatar
+    for message in st.session_state.messages:
+        if message["role"] == "user":
+            with st.chat_message("user"):
+                st.markdown(message["content"])
+        else:
+            avatar = img_path if img_path else char["emoji"]
+            with st.chat_message("assistant", avatar=avatar):
+                st.markdown(message["content"])
 
     # Audio dla ostatniej wiadomosci bota
     if st.session_state.messages and st.session_state.get("play_audio"):
