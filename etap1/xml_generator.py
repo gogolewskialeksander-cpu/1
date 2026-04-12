@@ -68,7 +68,6 @@ def build_xml(
         description = product.claude_description_pl or product.description
         category = product.claude_category or "Inne"
         sale_price = product.compute_sale_price(margin_percent)
-        price_netto = round(sale_price / 1.23, 2)
         avail = "1" if product.stock > 0 else "0"
 
         offer = etree.SubElement(
@@ -78,8 +77,6 @@ def build_xml(
                 "id": str(product.product_id),
                 "url": "",
                 "price": f"{sale_price:.2f}",
-                "price_netto": f"{price_netto:.2f}",
-                "vat": "23",
                 "avail": avail,
                 "weight": "0",
                 "stock": str(product.stock),
