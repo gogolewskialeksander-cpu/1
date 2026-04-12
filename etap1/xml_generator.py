@@ -70,12 +70,14 @@ def build_xml(
         sale_price = product.compute_sale_price(margin_percent)
         avail = "1" if product.stock > 0 else "0"
 
+        product_url = f"https://www.aliexpress.com/item/{product.product_id}.html"
+
         offer = etree.SubElement(
             root,
             "o",
             attrib={
                 "id": str(product.product_id),
-                "url": "",
+                "url": product_url,
                 "price": f"{sale_price:.2f}",
                 "avail": avail,
                 "weight": "0",
