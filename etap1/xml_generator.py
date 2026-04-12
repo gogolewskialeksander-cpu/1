@@ -1,19 +1,27 @@
 """
 Generator XML dla importu produktow do BaseLinker.
 
-Buduje plik XML w formacie:
-<offer>
-  <products>
-    <product id="...">
-      <name>...</name>
-      ...
-    </product>
-  </products>
-</offer>
+Buduje plik XML w formacie BaseLinker <offers>:
 
-Wszystkie znaki specjalne w polach tekstowych sa escape'owane. Po zapisie
-plik jest walidowany (ponowne parsowanie lxml) — jesli walidacja sie nie uda,
-funkcja rzuca wyjatek.
+<?xml version="1.0" encoding="UTF-8"?>
+<offers xmlns:xsi="..." version="1">
+ <o id="ID" url="" price="..." price_netto="..." vat="23" avail="1" weight="0" stock="...">
+  <cat><![CDATA[KATEGORIA]]></cat>
+  <n><![CDATA[TYTUL]]></n>
+  <desc><![CDATA[OPIS]]></desc>
+  <imgs>
+   <main url="PIERWSZE_ZDJECIE"/>
+   <i url="DRUGIE_ZDJECIE"/>
+  </imgs>
+  <attrs>
+   <a name="Kod_producenta"><![CDATA[SKU]]></a>
+   ...
+  </attrs>
+ </o>
+</offers>
+
+Wszystkie pola tekstowe opakowane w CDATA. Po zapisie plik jest walidowany
+przez ponowne parsowanie lxml.
 """
 from __future__ import annotations
 
@@ -26,19 +34,21 @@ from lxml import etree
 from aliexpress_client import Product
 from logger import Logger
 
+XSI_NS: str = "http://www.w3.org/2001/XMLSchema-instance"
 
-def _add_text_element(parent: etree._Element, tag: str, text: str) -> etree._Element:
-    """Pomocnik: tworzy element z tekstem. Text jest automatycznie escape'owany."""
+
+def _cdata(parent: etree._Element, tag: str, text: str) -> etree._Element:
+    """Tworzy element <tag><![CDATA[text]]></tag> i dodaje go do parenta."""
     element = etree.SubElement(parent, tag)
-    element.text = text if text else ""
+    element.text = etree.CDATA(text if text else "")
     return element
 
 
-def _add_attribute(parent: etree._Element, name: str, value: str) -> etree._Element:
-    """Dodaje <attribute name="...">value</attribute> do parenta."""
-    attr = etree.SubElement(parent, "attribute", name=name)
-    attr.text = value
-    return attr
+def _attr_cdata(parent: etree._Element, name: str, value: str) -> etree._Element:
+    """Tworzy <a name="name"><![CDATA[value]]></a> i dodaje do parenta."""
+    element = etree.SubElement(parent, "a", name=name)
+    element.text = etree.CDATA(value if value else "")
+    return element
 
 
 def build_xml(
@@ -46,7 +56,7 @@ def build_xml(
     margin_percent: float,
 ) -> bytes:
     """
-    Buduje strukturę XML z listy produktow.
+    Buduje strukturę XML zgodna z formatem importu BaseLinker (<offers>).
 
     Args:
         products: Lista zaakceptowanych produktow.
@@ -55,54 +65,54 @@ def build_xml(
     Returns:
         Bajty XML (UTF-8) z deklaracja XML na poczatku.
     """
-    root = etree.Element("offer")
-    products_node = etree.SubElement(root, "products")
+    root = etree.Element(
+        "offers",
+        attrib={
+            f"{{{XSI_NS}}}schemaLocation": "",
+            "version": "1",
+        },
+        nsmap={"xsi": XSI_NS},
+    )
 
     for product in products:
-        product_node = etree.SubElement(
-            products_node, "product", id=str(product.product_id)
-        )
-
         name = product.claude_title_pl or product.title
         description = product.claude_description_pl or product.description
         category = product.claude_category or "Inne"
         sale_price = product.compute_sale_price(margin_percent)
+        price_netto = round(sale_price / 1.23, 2)
+        avail = "1" if product.stock > 0 else "0"
 
-        _add_text_element(product_node, "name", name)
-        _add_text_element(product_node, "ean", "")
-        _add_text_element(product_node, "sku", product.sku or product.product_id)
-        _add_text_element(product_node, "category_name", category)
-        _add_text_element(product_node, "price", f"{sale_price:.2f}")
-        _add_text_element(product_node, "price_wholesale", f"{product.price:.2f}")
-        _add_text_element(product_node, "stock", str(product.stock))
-        _add_text_element(product_node, "weight", "0")
-        _add_text_element(product_node, "description", description)
+        offer = etree.SubElement(
+            root,
+            "o",
+            attrib={
+                "id": str(product.product_id),
+                "url": "",
+                "price": f"{sale_price:.2f}",
+                "price_netto": f"{price_netto:.2f}",
+                "vat": "23",
+                "avail": avail,
+                "weight": "0",
+                "stock": str(product.stock),
+            },
+        )
 
-        images_node = etree.SubElement(product_node, "images")
-        for image_url in product.images:
-            _add_text_element(images_node, "image", image_url)
+        _cdata(offer, "cat", category)
+        _cdata(offer, "n", name)
+        _cdata(offer, "desc", description)
 
-        attributes_node = etree.SubElement(product_node, "attributes")
-        _add_attribute(
-            attributes_node,
-            "Sprzedawca AliExpress",
-            product.seller_id or "unknown",
-        )
-        _add_attribute(
-            attributes_node,
-            "Czas dostawy",
-            f"{product.estimated_delivery_days} dni",
-        )
-        _add_attribute(
-            attributes_node,
-            "Magazyn",
-            product.ship_from_country or "EU",
-        )
-        _add_attribute(
-            attributes_node,
-            "Ocena potencjalu",
-            f"{product.claude_potential_score}/10",
-        )
+        imgs = etree.SubElement(offer, "imgs")
+        for idx, url in enumerate(product.images):
+            if idx == 0:
+                etree.SubElement(imgs, "main", url=url)
+            else:
+                etree.SubElement(imgs, "i", url=url)
+
+        attrs = etree.SubElement(offer, "attrs")
+        _attr_cdata(attrs, "Kod_producenta", product.sku or product.product_id)
+        _attr_cdata(attrs, "Czas_dostawy", f"{product.estimated_delivery_days} dni")
+        _attr_cdata(attrs, "Magazyn", product.ship_from_country or "EU")
+        _attr_cdata(attrs, "AliExpress_ID", str(product.product_id))
 
     xml_bytes: bytes = etree.tostring(
         root,
