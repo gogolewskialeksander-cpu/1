@@ -1,13 +1,11 @@
 """
-Generator XML dla importu produktow do BaseLinker.
-
-Buduje plik XML w formacie BaseLinker <offers>:
+Generator XML dla importu produktow do BaseLinker (format Ceneo XML).
 
 <?xml version="1.0" encoding="UTF-8"?>
-<offers xmlns:xsi="..." version="1">
+<offers>
  <o id="ID" url="" price="..." price_netto="..." vat="23" avail="1" weight="0" stock="...">
   <cat><![CDATA[KATEGORIA]]></cat>
-  <n><![CDATA[TYTUL]]></n>
+  <name><![CDATA[TYTUL]]></name>
   <desc><![CDATA[OPIS]]></desc>
   <imgs>
    <main url="PIERWSZE_ZDJECIE"/>
@@ -33,8 +31,6 @@ from lxml import etree
 
 from aliexpress_client import Product
 from logger import Logger
-
-XSI_NS: str = "http://www.w3.org/2001/XMLSchema-instance"
 
 
 def _cdata(parent: etree._Element, tag: str, text: str) -> etree._Element:
@@ -65,14 +61,7 @@ def build_xml(
     Returns:
         Bajty XML (UTF-8) z deklaracja XML na poczatku.
     """
-    root = etree.Element(
-        "offers",
-        attrib={
-            f"{{{XSI_NS}}}schemaLocation": "",
-            "version": "1",
-        },
-        nsmap={"xsi": XSI_NS},
-    )
+    root = etree.Element("offers")
 
     for product in products:
         name = product.claude_title_pl or product.title
@@ -98,7 +87,7 @@ def build_xml(
         )
 
         _cdata(offer, "cat", category)
-        _cdata(offer, "n", name)
+        _cdata(offer, "name", name)
         _cdata(offer, "desc", description)
 
         imgs = etree.SubElement(offer, "imgs")
