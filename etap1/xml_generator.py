@@ -2,8 +2,8 @@
 Generator XML dla importu produktow do BaseLinker (format Ceneo XML).
 
 <?xml version="1.0" encoding="UTF-8"?>
-<offers>
- <o id="ID" url="" price="..." price_netto="..." vat="23" avail="1" weight="0" stock="...">
+<offers xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" version="1">
+ <o id="ID" url="https://..." price="..." price_netto="..." vat="23" avail="1" weight="0" stock="...">
   <cat><![CDATA[KATEGORIA]]></cat>
   <name><![CDATA[TYTUL]]></name>
   <desc><![CDATA[OPIS]]></desc>
@@ -31,6 +31,8 @@ from lxml import etree
 
 from aliexpress_client import Product
 from logger import Logger
+
+XSI_NS: str = "http://www.w3.org/2001/XMLSchema-instance"
 
 
 def _cdata(parent: etree._Element, tag: str, text: str) -> etree._Element:
@@ -61,7 +63,11 @@ def build_xml(
     Returns:
         Bajty XML (UTF-8) z deklaracja XML na poczatku.
     """
-    root = etree.Element("offers")
+    root = etree.Element(
+        "offers",
+        attrib={"version": "1"},
+        nsmap={"xsi": XSI_NS},
+    )
 
     for product in products:
         name = product.claude_title_pl or product.title
