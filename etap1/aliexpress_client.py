@@ -56,6 +56,12 @@ class Product:
     estimated_delivery_days: int
     variants: List[Dict[str, Any]] = field(default_factory=list)
 
+    # Wymiary i waga opakowania
+    weight_kg: float = 0.0
+    length_cm: float = 0.0
+    width_cm: float = 0.0
+    height_cm: float = 0.0
+
     # Pola wypelniane przez Claude
     claude_title_pl: str = ""
     claude_description_pl: str = ""
@@ -401,6 +407,13 @@ class AliExpressClient:
         if price == 0.0:
             return None
 
+        # Waga i wymiary opakowania
+        package_info = root.get("package_info_dto", {})
+        weight_kg = float(package_info.get("package_weight", 0) or 0)
+        length_cm = float(package_info.get("package_length", 0) or 0)
+        width_cm = float(package_info.get("package_width", 0) or 0)
+        height_cm = float(package_info.get("package_height", 0) or 0)
+
         # Dostawa
         ship_from_country = logistics.get("ship_from_country", "CN")
         estimated_days = int(logistics.get("delivery_time", 30) or 30)
@@ -434,6 +447,10 @@ class AliExpressClient:
             ship_from_country=str(ship_from_country).upper(),
             estimated_delivery_days=estimated_days,
             variants=variants,
+            weight_kg=weight_kg,
+            length_cm=length_cm,
+            width_cm=width_cm,
+            height_cm=height_cm,
         )
 
 
@@ -472,6 +489,7 @@ def get_mock_products() -> List[Product]:
                 {"sku_id": "BIKE-HOLDER-BLK", "price": 18.50, "stock": 120},
                 {"sku_id": "BIKE-HOLDER-SLV", "price": 19.50, "stock": 127},
             ],
+            weight_kg=0.15, length_cm=12.0, width_cm=8.0, height_cm=5.0,
         ),
         Product(
             product_id="1005006234567890",
@@ -498,6 +516,7 @@ def get_mock_products() -> List[Product]:
                 {"sku_id": "USBC-2M-BLK", "price": 12.30, "stock": 450},
                 {"sku_id": "USBC-2M-WHT", "price": 12.30, "stock": 440},
             ],
+            weight_kg=0.08, length_cm=15.0, width_cm=8.0, height_cm=3.0,
         ),
         Product(
             product_id="1005006345678901",
@@ -518,6 +537,7 @@ def get_mock_products() -> List[Product]:
             variants=[
                 {"sku_id": "KEYCHAIN-RND", "price": 2.10, "stock": 50},
             ],
+            weight_kg=0.05, length_cm=10.0, width_cm=6.0, height_cm=2.0,
         ),
         Product(
             product_id="1005006456789012",
@@ -546,6 +566,7 @@ def get_mock_products() -> List[Product]:
                 {"sku_id": "LED-RGB-5M", "price": 45.80, "stock": 88},
                 {"sku_id": "LED-RGB-10M", "price": 79.80, "stock": 90},
             ],
+            weight_kg=0.30, length_cm=20.0, width_cm=10.0, height_cm=5.0,
         ),
         Product(
             product_id="1005006567890123",
@@ -573,6 +594,7 @@ def get_mock_products() -> List[Product]:
                 {"sku_id": "SMARTWATCH-BLK", "price": 78.40, "stock": 45},
                 {"sku_id": "SMARTWATCH-SLV", "price": 78.40, "stock": 50},
             ],
+            weight_kg=0.12, length_cm=9.0, width_cm=7.0, height_cm=4.0,
         ),
         Product(
             product_id="1005006678901234",
@@ -591,6 +613,7 @@ def get_mock_products() -> List[Product]:
             ship_from_country="PL",
             estimated_delivery_days=4,
             variants=[{"sku_id": "BROKEN-001", "price": 1.99, "stock": 10}],
+            weight_kg=0.05, length_cm=5.0, width_cm=5.0, height_cm=2.0,
         ),
         Product(
             product_id="1005006789012345",
@@ -618,6 +641,7 @@ def get_mock_products() -> List[Product]:
                 {"sku_id": "CAMP-CHAIR-GRN", "price": 58.90, "stock": 70},
                 {"sku_id": "CAMP-CHAIR-BLU", "price": 58.90, "stock": 73},
             ],
+            weight_kg=1.20, length_cm=55.0, width_cm=12.0, height_cm=12.0,
         ),
         Product(
             product_id="1005006890123456",
@@ -641,6 +665,7 @@ def get_mock_products() -> List[Product]:
             ship_from_country="PL",
             estimated_delivery_days=3,
             variants=[{"sku_id": "CHOPPER-WHT", "price": 32.50, "stock": 67}],
+            weight_kg=0.45, length_cm=14.0, width_cm=14.0, height_cm=12.0,
         ),
         Product(
             product_id="1005006901234567",
@@ -668,6 +693,7 @@ def get_mock_products() -> List[Product]:
                 {"sku_id": "PET-FOUNTAIN-WHT", "price": 54.20, "stock": 40},
                 {"sku_id": "PET-FOUNTAIN-GRY", "price": 54.20, "stock": 42},
             ],
+            weight_kg=0.65, length_cm=22.0, width_cm=22.0, height_cm=15.0,
         ),
         Product(
             product_id="1005007012345678",
@@ -692,5 +718,6 @@ def get_mock_products() -> List[Product]:
             ship_from_country="CN",  # Ten produkt zostanie odrzucony (brak EU magazynu)
             estimated_delivery_days=18,
             variants=[{"sku_id": "EARBUDS-BLK", "price": 69.00, "stock": 214}],
+            weight_kg=0.10, length_cm=8.0, width_cm=6.0, height_cm=4.0,
         ),
     ]

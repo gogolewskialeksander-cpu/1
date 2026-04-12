@@ -88,7 +88,7 @@ def build_xml(
                 "price_netto": f"{price_netto:.2f}",
                 "vat": "23",
                 "avail": avail,
-                "weight": "0",
+                "weight": f"{product.weight_kg:.2f}",
                 "stock": str(product.stock),
             },
         )
@@ -109,6 +109,14 @@ def build_xml(
         _attr_cdata(attrs, "Czas_dostawy", f"{product.estimated_delivery_days} dni")
         _attr_cdata(attrs, "Magazyn", product.ship_from_country or "EU")
         _attr_cdata(attrs, "AliExpress_ID", str(product.product_id))
+        if product.weight_kg > 0:
+            _attr_cdata(attrs, "Waga", f"{product.weight_kg:.2f} kg")
+        if product.length_cm > 0 and product.width_cm > 0 and product.height_cm > 0:
+            _attr_cdata(
+                attrs,
+                "Wymiary",
+                f"{product.length_cm:.0f} x {product.width_cm:.0f} x {product.height_cm:.0f} cm",
+            )
 
     xml_bytes: bytes = etree.tostring(
         root,
