@@ -111,12 +111,12 @@ def build_xml(
         _attr_cdata(attrs, "AliExpress_ID", str(product.product_id))
         if product.weight_kg > 0:
             _attr_cdata(attrs, "Waga", f"{product.weight_kg:.2f} kg")
-        if product.length_cm > 0 and product.width_cm > 0 and product.height_cm > 0:
-            _attr_cdata(
-                attrs,
-                "Wymiary",
-                f"{product.length_cm:.0f} x {product.width_cm:.0f} x {product.height_cm:.0f} cm",
-            )
+        if product.length_cm > 0:
+            _attr_cdata(attrs, "długość", f"{product.length_cm:.0f}")
+        if product.width_cm > 0:
+            _attr_cdata(attrs, "szerokość", f"{product.width_cm:.0f}")
+        if product.height_cm > 0:
+            _attr_cdata(attrs, "wysokość", f"{product.height_cm:.0f}")
 
     xml_bytes: bytes = etree.tostring(
         root,
