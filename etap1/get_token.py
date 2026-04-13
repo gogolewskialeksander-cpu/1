@@ -33,7 +33,7 @@ from dotenv import load_dotenv
 
 # ===== ENDPOINTY =====
 OAUTH_URL = "https://oauth.aliexpress.com/authorize"
-TOKEN_URL = "https://api-sg.aliexpress.com/rest/auth/token/create"
+SYNC_URL = "https://api-sg.aliexpress.com/sync"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ENV_PATH = SCRIPT_DIR / ".env"
@@ -134,7 +134,8 @@ def generate_oauth_url(app_key: str, redirect_uri: str) -> str:
         "sp": "ae",
         "view": "web",
     }
-    url = OAUTH_URL + "?" + urlencode(params, quote_via=lambda s, *_: s)
+    # urlencode domyslnie koduje wartosci (np. https:// -> https%3A%2F%2F)
+    url = OAUTH_URL + "?" + urlencode(params)
     return url
 
 
@@ -144,14 +145,19 @@ def generate_oauth_url(app_key: str, redirect_uri: str) -> str:
 
 def exchange_code(code: str, app_key: str, app_secret: str) -> dict:
     """
-    POST /rest/auth/token/create
+    Wymiana authorization code na Access Token przez standardowy sync endpoint.
 
-    Parametry wymagane przez AliExpress:
-      app_key, timestamp (ms), sign_method, code, grant_type, sign
+    Uzywa metody aliexpress.system.oauth.token (identyczny format podpisu
+    jak wszystkie inne wywolania API — TOP sync endpoint, nie REST).
+
+    Endpoint: POST https://api-sg.aliexpress.com/sync
+    Method:   aliexpress.system.oauth.token
     """
+    sync_url = "https://api-sg.aliexpress.com/sync"
     timestamp = str(int(time.time() * 1000))
 
     params: dict[str, str] = {
+        "method": "aliexpress.system.oauth.token",
         "app_key": app_key,
         "timestamp": timestamp,
         "sign_method": "sha256",
@@ -162,14 +168,14 @@ def exchange_code(code: str, app_key: str, app_secret: str) -> dict:
     # Podpisz wszystkie parametry (przed dodaniem sign do dict)
     params["sign"] = build_signature(params, app_secret)
 
-    info(f"Endpoint: POST {TOKEN_URL}")
+    info(f"Endpoint: POST {sync_url}")
+    info(f"Method:   aliexpress.system.oauth.token")
     info(f"app_key={app_key}  timestamp={timestamp}  code={code[:12]}...")
 
     resp = requests.post(
-        TOKEN_URL,
+        sync_url,
         data=params,
         timeout=30,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
 
     info(f"HTTP status: {resp.status_code}")
@@ -189,14 +195,25 @@ def extract_token(data: dict) -> tuple[str, str, int]:
     """
     Wyciaga (access_token, refresh_token, expire_time) z odpowiedzi.
 
-    AliExpress moze zwrocic kilka formatow — sprawdzamy wszystkie.
+    aliexpress.system.oauth.token zwraca dane pod kluczem:
+      aliexpress_system_oauth_token_response -> result
+    Obslugujemy tez starsze/alternatywne formaty.
     """
-    # Format 1: plaska struktura
+    # Format TOP sync: aliexpress_system_oauth_token_response -> result
+    top_resp = data.get("aliexpress_system_oauth_token_response", {})
+    if top_resp:
+        result = top_resp.get("result", top_resp)
+        access_token = result.get("access_token", "")
+        refresh_token = result.get("refresh_token", "")
+        expire_time = int(result.get("expire_time", 0) or 0)
+        return access_token, refresh_token, expire_time
+
+    # Format plaska struktura (REST endpoint)
     access_token = data.get("access_token", "")
     refresh_token = data.get("refresh_token", "")
     expire_time = int(data.get("expire_time", 0) or data.get("expires_in", 0) or 0)
 
-    # Format 2: zagniezdzone w "result"
+    # Format zagniezdzone w "result"
     if not access_token and isinstance(data.get("result"), dict):
         result = data["result"]
         access_token = result.get("access_token", "")
