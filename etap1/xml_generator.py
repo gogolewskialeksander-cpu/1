@@ -112,11 +112,11 @@ def build_xml(
         if product.weight_kg > 0:
             _attr_cdata(attrs, "Waga", f"{product.weight_kg:.2f} kg")
         if product.length_cm > 0:
-            _attr_cdata(attrs, "długość", f"{product.length_cm:.0f}")
+            _attr_cdata(attrs, "dlugosc_cm", f"{product.length_cm:.0f}")
         if product.width_cm > 0:
-            _attr_cdata(attrs, "szerokość", f"{product.width_cm:.0f}")
+            _attr_cdata(attrs, "szerokosc_cm", f"{product.width_cm:.0f}")
         if product.height_cm > 0:
-            _attr_cdata(attrs, "wysokość", f"{product.height_cm:.0f}")
+            _attr_cdata(attrs, "wysokosc_cm", f"{product.height_cm:.0f}")
 
     xml_bytes: bytes = etree.tostring(
         root,
