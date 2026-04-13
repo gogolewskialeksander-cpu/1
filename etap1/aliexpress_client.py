@@ -264,14 +264,13 @@ class AliExpressClient:
             response = self._call(
                 "aliexpress.ds.recommend.feed.get",
                 {
-                    "feed_name": "DS_bestseller",
+                    "feed_name": "DS_bestseller_en",
                     "page_no": page_no,
                     "page_size": page_size,
                     "country": "PL",
                     "target_currency": "PLN",
-                    "target_language": "PL",
+                    "target_language": "EN",
                     "ship_from_countries": ",".join(ship_from_countries),
-                    "keyword": keyword,
                 },
             )
 
