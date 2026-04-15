@@ -148,26 +148,29 @@ def exchange_code(code: str, app_key: str, app_secret: str) -> dict:
 
     Endpoint: POST https://api-sg.aliexpress.com/rest/auth/token/create
 
-    Podpis HMAC-SHA256 dla REST: sciezka endpointu jest doklejana
-    przed posortowanymi parami klucz+wartosc w base stringu.
-
-    Body: code, grant_type, app_key, timestamp, sign_method, sign
+    Podpis HMAC-SHA256 dla REST endpointow AliExpress:
+      Parametry do podpisania: app_key, code, grant_type, timestamp
+      Base string: APP_SECRET + param1 + value1 + ... + APP_SECRET
+      Sign = HMAC-SHA256(key=APP_SECRET, msg=base_string).upper()
     """
     rest_url = "https://api-sg.aliexpress.com/rest/auth/token/create"
-    api_path = "/rest/auth/token/create"
     timestamp = str(int(time.time() * 1000))
 
-    params: dict[str, str] = {
+    # Tylko te 4 parametry ida do podpisu (posortowane alfabetycznie)
+    sign_params: dict[str, str] = {
         "app_key": app_key,
-        "timestamp": timestamp,
-        "sign_method": "sha256",
         "code": code,
         "grant_type": "authorization_code",
+        "timestamp": timestamp,
     }
 
-    # Podpis REST: sciezka + posortowane pary klucz+wartosc
-    sorted_items = sorted(params.items())
-    base_string = api_path + "".join(f"{k}{v}" for k, v in sorted_items)
+    # Format REST: APP_SECRET + key1value1key2value2... + APP_SECRET
+    sorted_items = sorted(sign_params.items())
+    base_string = (
+        app_secret
+        + "".join(f"{k}{v}" for k, v in sorted_items)
+        + app_secret
+    )
     debug(f"Base string (pierwsze 120 zn.): {base_string[:120]}")
     sign = hmac.new(
         key=app_secret.encode("utf-8"),
@@ -175,7 +178,16 @@ def exchange_code(code: str, app_key: str, app_secret: str) -> dict:
         digestmod=hashlib.sha256,
     ).hexdigest().upper()
     debug(f"HMAC-SHA256: {sign}")
-    params["sign"] = sign
+
+    # Pelny payload POST (sign_method wymagany przez endpoint)
+    params: dict[str, str] = {
+        "app_key": app_key,
+        "code": code,
+        "grant_type": "authorization_code",
+        "timestamp": timestamp,
+        "sign_method": "sha256",
+        "sign": sign,
+    }
 
     info(f"Endpoint: POST {rest_url}")
     info(f"app_key={app_key}  timestamp={timestamp}  code={code[:12]}...")
