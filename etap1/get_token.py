@@ -142,21 +142,64 @@ def generate_oauth_url(app_key: str, redirect_uri: str) -> str:
 # Krok 3 — Wymiana code na Access Token
 # ---------------------------------------------------------------------------
 
+def _all_sign_variants(sign_params: dict, app_secret: str) -> dict[str, str]:
+    """
+    Generuje wszystkie mozliwe warianty podpisu dla REST endpointu.
+    Zwraca slownik {nazwa_wariantu: podpis}.
+    """
+    import hashlib as _hl
+    import hmac as _hm
+
+    sorted_items = sorted(sign_params.items())
+    params_str = "".join(f"{k}{v}" for k, v in sorted_items)
+
+    variants: dict[str, str] = {}
+
+    # Wariant A: HMAC-SHA256, msg = SECRET + params + SECRET
+    base_a = app_secret + params_str + app_secret
+    variants["A: HMAC-SHA256 (SECRET+params+SECRET)"] = _hm.new(
+        key=app_secret.encode(), msg=base_a.encode(), digestmod=_hl.sha256
+    ).hexdigest().upper()
+
+    # Wariant B: HMAC-SHA256, msg = SECRET + params (bez konczacego SECRET)
+    base_b = app_secret + params_str
+    variants["B: HMAC-SHA256 (SECRET+params)"] = _hm.new(
+        key=app_secret.encode(), msg=base_b.encode(), digestmod=_hl.sha256
+    ).hexdigest().upper()
+
+    # Wariant C: HMAC-SHA256, msg = params only (standard TOP API)
+    variants["C: HMAC-SHA256 (params only)"] = _hm.new(
+        key=app_secret.encode(), msg=params_str.encode(), digestmod=_hl.sha256
+    ).hexdigest().upper()
+
+    # Wariant D: MD5, msg = SECRET + params + SECRET
+    import hashlib as _hl2
+    variants["D: MD5 (SECRET+params+SECRET)"] = _hl2.md5(
+        (app_secret + params_str + app_secret).encode()
+    ).hexdigest().upper()
+
+    # Wariant E: MD5, msg = params only
+    variants["E: MD5 (params only)"] = _hl2.md5(
+        params_str.encode()
+    ).hexdigest().upper()
+
+    return variants
+
+
 def exchange_code(code: str, app_key: str, app_secret: str) -> dict:
     """
     Wymiana authorization code na Access Token przez REST endpoint.
 
     Endpoint: POST https://api-sg.aliexpress.com/rest/auth/token/create
 
-    Podpis HMAC-SHA256 dla REST endpointow AliExpress:
-      Parametry do podpisania: app_key, code, grant_type, timestamp
-      Base string: APP_SECRET + param1 + value1 + ... + APP_SECRET
-      Sign = HMAC-SHA256(key=APP_SECRET, msg=base_string).upper()
+    Drukuje wszystkie warianty podpisu w [DBG] — po zobaczeniu ktory
+    zwroci sukces zamiast IncompleteSignature, zaktualizuj skrypt.
+    Aktualnie uzywa wariantu A (SECRET+params+SECRET, HMAC-SHA256).
     """
     rest_url = "https://api-sg.aliexpress.com/rest/auth/token/create"
     timestamp = str(int(time.time() * 1000))
 
-    # Tylko te 4 parametry ida do podpisu (posortowane alfabetycznie)
+    # Parametry do podpisania (posortowane alfabetycznie: a, c, g, t)
     sign_params: dict[str, str] = {
         "app_key": app_key,
         "code": code,
@@ -164,22 +207,25 @@ def exchange_code(code: str, app_key: str, app_secret: str) -> dict:
         "timestamp": timestamp,
     }
 
-    # Format REST: APP_SECRET + key1value1key2value2... + APP_SECRET
+    # Pokaz wszystkie warianty podpisu
     sorted_items = sorted(sign_params.items())
-    base_string = (
-        app_secret
-        + "".join(f"{k}{v}" for k, v in sorted_items)
-        + app_secret
-    )
-    debug(f"Base string (pierwsze 120 zn.): {base_string[:120]}")
-    sign = hmac.new(
-        key=app_secret.encode("utf-8"),
-        msg=base_string.encode("utf-8"),
-        digestmod=hashlib.sha256,
-    ).hexdigest().upper()
-    debug(f"HMAC-SHA256: {sign}")
+    params_str = "".join(f"{k}{v}" for k, v in sorted_items)
+    debug(f"Params string: {params_str[:100]}")
+    debug(f"Kolejnosc (alfabetyczna): {[k for k, _ in sorted_items]}")
 
-    # Pelny payload POST (sign_method wymagany przez endpoint)
+    variants = _all_sign_variants(sign_params, app_secret)
+    debug("=" * 50)
+    debug("WSZYSTKIE WARIANTY PODPISU:")
+    for name, sig in variants.items():
+        debug(f"  {name}")
+        debug(f"    => {sig}")
+    debug("=" * 50)
+
+    # Uzywamy wariantu A — zmien jesli inny wariant zadziala
+    active_variant = "A: HMAC-SHA256 (SECRET+params+SECRET)"
+    sign = variants[active_variant]
+    debug(f"Aktywny wariant: {active_variant}")
+
     params: dict[str, str] = {
         "app_key": app_key,
         "code": code,
