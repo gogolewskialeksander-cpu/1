@@ -151,7 +151,7 @@ class AliExpressClient:
             "method": method,
             "simplify": "false",
             "format": "json",
-            "session": self.access_token,
+            "access_token": self.access_token,
         }
         # Dokladamy parametry metody (zawsze jako string do podpisu)
         for key, value in method_params.items():
@@ -243,81 +243,81 @@ class AliExpressClient:
         self,
         ship_from_countries: List[str],
         limit: int,
-        keyword: str = "phone holder",
+        keyword: str = "",
     ) -> List[str]:
         """
-        Zwraca liste product_id przez aliexpress.ds.product.search.
+        Zwraca liste product_id przez aliexpress.ds.recommend.feed.get.
 
-        Filtruje wyniki po `ship_from_country` (magazyn EU) jesli
-        to pole jest dostepne w odpowiedzi wyszukiwarki.
+        Probuje kolejno feed_name: DS_bestseller_en, DS_NEW_ARRIVAL,
+        DS_HOT_SELLER, DS_default — az jeden zwroci produkty.
+        Filtruje wyniki po ship_from_country (magazyn EU).
 
         Args:
             ship_from_countries: Lista kodow krajow EU (np. ['PL', 'DE']).
             limit: Maksymalna liczba produktow do pobrania.
-            keyword: Slowo kluczowe do wyszukiwania.
 
         Returns:
             Lista identyfikatorow produktow.
         """
         eu_set = {c.upper() for c in ship_from_countries}
-        product_ids: List[str] = []
-        page_no = 1
-        page_size = min(20, limit)
+        feed_names = ["DS_bestseller_en", "DS_NEW_ARRIVAL", "DS_HOT_SELLER", "DS_default"]
 
-        while len(product_ids) < limit:
-            response = self._call(
-                "aliexpress.ds.product.search",
-                {
-                    "keywords": keyword,
-                    "local_country": "PL",
-                    "ship_to_country": "PL",
-                    "local_currency": "PLN",
-                    "local_language": "PL",
-                    "page_no": page_no,
-                    "page_size": page_size,
-                    "sort": "SALE_PRICE_ASC",
-                },
-            )
+        for feed_name in feed_names:
+            product_ids: List[str] = []
+            page_no = 1
+            page_size = min(20, limit)
 
-            # Odpowiedz: aliexpress_ds_product_search_response -> result
-            root = response.get("aliexpress_ds_product_search_response", {})
-            result = root.get("result", {})
+            self.logger.ok(f"AliExpress feed: {feed_name}")
 
-            # Produkty moga byc w roznych miejscach w zaleznosci od wersji API
-            products: List[Dict[str, Any]] = []
-            if isinstance(result.get("products"), list):
-                products = result["products"]
-            elif isinstance(result.get("products"), dict):
-                products = result["products"].get("product", [])
-            elif isinstance(result.get("search_product_list"), dict):
-                products = result["search_product_list"].get("product", [])
-
-            if not products:
-                self.logger.warn(
-                    f"aliexpress.ds.product.search strona {page_no}: brak produktow. "
-                    f"Surowa odpowiedz: {str(root)[:300]}"
-                )
-                break
-
-            for p in products:
-                pid = str(p.get("product_id", ""))
-                if not pid:
-                    continue
-                # Filtruj po magazynie EU jesli pole dostepne
-                ship_from = str(p.get("ship_from_country", "")).upper()
-                if ship_from and eu_set and ship_from not in eu_set:
-                    continue
-                product_ids.append(pid)
-                if len(product_ids) >= limit:
+            while len(product_ids) < limit:
+                try:
+                    response = self._call(
+                        "aliexpress.ds.recommend.feed.get",
+                        {
+                            "feed_name": feed_name,
+                            "country": "PL",
+                            "currency": "PLN",
+                            "language": "EN",
+                            "page_no": page_no,
+                            "page_size": page_size,
+                        },
+                    )
+                except AliExpressAPIError as e:
+                    self.logger.warn(f"Feed {feed_name} blad: {e}")
                     break
 
-            if len(product_ids) >= limit:
-                break
-            if len(products) < page_size:
-                break
-            page_no += 1
+                # aliexpress_ds_recommend_feed_get_response -> result -> products
+                root = response.get("aliexpress_ds_recommend_feed_get_response", {})
+                result = root.get("result", {})
+                products = result.get("products", {}).get("traffic_product_d_t_o", [])
 
-        return product_ids[:limit]
+                if not products:
+                    self.logger.warn(
+                        f"Feed {feed_name} strona {page_no}: brak produktow. "
+                        f"Odpowiedz: {str(root)[:200]}"
+                    )
+                    break
+
+                for p in products:
+                    pid = str(p.get("product_id", ""))
+                    if not pid:
+                        continue
+                    ship_from = str(p.get("ship_from_country", "")).upper()
+                    if ship_from and eu_set and ship_from not in eu_set:
+                        continue
+                    product_ids.append(pid)
+                    if len(product_ids) >= limit:
+                        break
+
+                if len(product_ids) >= limit or len(products) < page_size:
+                    break
+                page_no += 1
+
+            if product_ids:
+                self.logger.ok(f"Feed {feed_name}: znaleziono {len(product_ids)} produktow")
+                return product_ids[:limit]
+
+        return []
 
     def fetch_products(
         self,
