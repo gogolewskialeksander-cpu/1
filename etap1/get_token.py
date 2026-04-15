@@ -300,6 +300,183 @@ def exchange_code(code: str, app_key: str, app_secret: str) -> dict:
             if result is not None:
                 return result
 
+    # ================================================================
+    # WARIANT 14-20: Sync endpoint z method=aliexpress.system.oauth.token
+    # Standard TOP API wymaga method, format, v w sygnaturze.
+    # ================================================================
+    debug("=" * 56)
+    debug("WARIANTY 14-20: SYNC endpoint (aliexpress.system.oauth.token)")
+    debug("=" * 56)
+
+    sync_url = SYNC_URL  # https://api-sg.aliexpress.com/sync
+    p_sync = {
+        "method": "aliexpress.system.oauth.token",
+        "app_key": app_key,
+        "timestamp": timestamp,
+        "format": "json",
+        "v": "2.0",
+        "sign_method": "sha256",
+        "code": code,
+        "grant_type": "authorization_code",
+    }
+    p_sync_md5 = {**p_sync}
+
+    def _hmac_sign(params: dict) -> str:
+        base = "".join(f"{k}{v}" for k, v in sorted(params.items()))
+        debug(f"  HMAC base[0:100]={base[:100]}")
+        return hmac.new(
+            key=app_secret.encode(), msg=base.encode(),
+            digestmod=hashlib.sha256,
+        ).hexdigest().upper()
+
+    def _hmac_sign_lower(params: dict) -> str:
+        base = "".join(f"{k}{v}" for k, v in sorted(params.items()))
+        return hmac.new(
+            key=app_secret.encode(), msg=base.encode(),
+            digestmod=hashlib.sha256,
+        ).hexdigest()
+
+    def _md5_sign(params: dict, prefix: str = "", suffix: str = "") -> str:
+        base = prefix + "".join(f"{k}{v}" for k, v in sorted(params.items())) + suffix
+        debug(f"  MD5 base[0:100]={base[:100]}")
+        return hashlib.md5(base.encode()).hexdigest().upper()
+
+    def try_sync(label: str, extra_params: dict, sign_fn) -> dict | None:
+        p = {**p_sync, **extra_params}
+        s = sign_fn(p)
+        body = {**p, "sign": s}
+        debug(f"--- Proba [{label}] sync_url ---")
+        try:
+            resp = _do_request(sync_url, body, "post_form")
+        except requests.RequestException as e:
+            debug(f"  => HTTP error: {e}")
+            return None
+        nonlocal last_response
+        debug(f"  RESPONSE: HTTP {resp.status_code}")
+        debug(f"  Body:     {resp.text[:400]}")
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {"raw": resp.text}
+        last_response = data
+        # REST: plaska struktura z access_token
+        # SYNC: zagniezdzone w aliexpress_system_oauth_token_response
+        nested = data.get("aliexpress_system_oauth_token_response", {})
+        if resp.status_code == 200 and (
+            data.get("access_token") or nested.get("access_token")
+        ):
+            if nested.get("access_token"):
+                data = nested  # normalizuj do plaskiej struktury
+            info(f"TRAFIONY WARIANT: [{label}]")
+            return data
+        return None
+
+    # 14: SYNC HMAC-SHA256 standard
+    r = try_sync("14: SYNC HMAC sha256", {}, _hmac_sign)
+    if r: return r
+
+    # 15: SYNC MD5 S+p+S (classic TOP format)
+    r = try_sync("15: SYNC MD5 S+p+S", {},
+                 lambda p: _md5_sign(p, prefix=app_secret, suffix=app_secret))
+    if r: return r
+
+    # 16: SYNC HMAC lowercase hex
+    r = try_sync("16: SYNC HMAC lower", {}, _hmac_sign_lower)
+    if r: return r
+
+    # 17: SYNC bez format i v (minimalny zestaw)
+    p_sync_minimal = {
+        "method": "aliexpress.system.oauth.token",
+        "app_key": app_key,
+        "timestamp": timestamp,
+        "sign_method": "sha256",
+        "code": code,
+        "grant_type": "authorization_code",
+    }
+    s17 = _hmac_sign(p_sync_minimal)
+    body17 = {**p_sync_minimal, "sign": s17}
+    r = try_request("17: SYNC-minimal HMAC", body17, "post_form")
+    if r: return r
+
+    # ================================================================
+    # WARIANT 18-22: REST endpoint z nowymi kombinacjami
+    # ================================================================
+    debug("=" * 56)
+    debug("WARIANTY 18-22: REST z nowymi kombinacjami")
+    debug("=" * 56)
+
+    # 18: REST + redirect_uri w body I podpisie
+    if redirect_uri:
+        p18 = {**p5, "redirect_uri": redirect_uri}
+        s18 = _hmac_sign(p18)
+        body18 = {**p18, "sign": s18}
+        r = try_request("18: REST+redirect_uri HMAC", body18, "post_form")
+        if r: return r
+
+    # 19: REST + format=json + v=2.0 w podpisie
+    p19 = {**p5, "format": "json", "v": "2.0"}
+    s19 = _hmac_sign(p19)
+    body19 = {**p19, "sign": s19}
+    r = try_request("19: REST+format+v HMAC", body19, "post_form")
+    if r: return r
+
+    # 20: REST lowercase hex
+    s20 = _hmac_sign_lower(p5)
+    body20 = {**p4, "sign_method": "sha256", "sign": s20}
+    r = try_request("20: REST HMAC lowercase", body20, "post_form")
+    if r: return r
+
+    # 21: REST timestamp w sekundach (nie milisekundach)
+    ts_sec = str(int(time.time()))
+    p21 = {"app_key": app_key, "code": code, "grant_type": "authorization_code",
+           "timestamp": ts_sec, "sign_method": "sha256"}
+    s21 = _hmac_sign(p21)
+    body21 = {**p21, "sign": s21}
+    r = try_request("21: REST timestamp-sec HMAC", body21, "post_form")
+    if r: return r
+
+    # 22: REST base string z = i & separatorami (URL-query format)
+    def _hmac_url_fmt(params: dict) -> str:
+        qs = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        debug(f"  HMAC url-fmt base[0:100]={qs[:100]}")
+        return hmac.new(
+            key=app_secret.encode(), msg=qs.encode(),
+            digestmod=hashlib.sha256,
+        ).hexdigest().upper()
+
+    s22 = _hmac_url_fmt(p5)
+    body22 = {**p4, "sign_method": "sha256", "sign": s22}
+    r = try_request("22: REST base-with-equals HMAC", body22, "post_form")
+    if r: return r
+
+    # 23: REST auth params w URL query, business w body
+    p23_url = {"app_key": app_key, "timestamp": timestamp,
+               "sign_method": "sha256"}
+    p23_biz = {"code": code, "grant_type": "authorization_code"}
+    p23_all = {**p23_url, **p23_biz}
+    s23 = _hmac_sign(p23_all)
+    p23_url["sign"] = s23
+    from urllib.parse import urlencode as _ue23
+    rest_url_with_qs = rest_url + "?" + _ue23(p23_url)
+    debug(f"--- Proba [23: REST split URL/body] ---")
+    debug(f"  URL: {rest_url_with_qs}")
+    debug(f"  Body: {p23_biz}")
+    try:
+        resp23 = requests.post(rest_url_with_qs, data=p23_biz,
+                               headers={"Content-Type": "application/x-www-form-urlencoded"},
+                               timeout=15)
+        debug(f"  RESPONSE: HTTP {resp23.status_code}  {resp23.text[:400]}")
+        try:
+            d23 = resp23.json()
+        except ValueError:
+            d23 = {"raw": resp23.text}
+        last_response = d23
+        if resp23.status_code == 200 and d23.get("access_token"):
+            info("TRAFIONY WARIANT: [23: REST split URL/body]")
+            return d23
+    except requests.RequestException as e:
+        debug(f"  => HTTP error: {e}")
+
     info("Zaden z wariantow nie zwrocil sukcesu.")
     info("Pelna ostatnia odpowiedz powyzej w [DBG].")
     return last_response
@@ -324,6 +501,15 @@ def extract_token(data: dict) -> tuple[str, str, int]:
 
     if access_token:
         return access_token, refresh_token, expire_time
+
+    # Format SYNC — aliexpress_system_oauth_token_response
+    nested = data.get("aliexpress_system_oauth_token_response", {})
+    if nested.get("access_token"):
+        return (
+            nested.get("access_token", ""),
+            nested.get("refresh_token", ""),
+            int(nested.get("expire_time", 0) or 0),
+        )
 
     # Zagniezdzone w "result" (wariant)
     if isinstance(data.get("result"), dict):
