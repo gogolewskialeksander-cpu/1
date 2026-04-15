@@ -142,135 +142,146 @@ def generate_oauth_url(app_key: str, redirect_uri: str) -> str:
 # Krok 3 — Wymiana code na Access Token
 # ---------------------------------------------------------------------------
 
-def _make_sign(params_str: str, app_secret: str, algo: str, wrap: str) -> str:
-    """Generuje jeden wariant podpisu."""
-    if wrap == "both":
-        msg = app_secret + params_str + app_secret
-    elif wrap == "prefix":
-        msg = app_secret + params_str
-    else:
-        msg = params_str
+def _do_request(url: str, body: dict, mode: str) -> requests.Response:
+    """Wysyla request i drukuje pelny request body + naglowki."""
+    from urllib.parse import urlencode as _ue
+    if mode == "post_form":
+        hdrs = {"Content-Type": "application/x-www-form-urlencoded"}
+        debug(f"  REQUEST: POST {url}")
+        debug(f"  Headers: {hdrs}")
+        debug(f"  Body:    {_ue(sorted(body.items()))}")
+        return requests.post(url, data=body, headers=hdrs, timeout=15)
+    elif mode == "post_json":
+        hdrs = {"Content-Type": "application/json"}
+        debug(f"  REQUEST: POST {url}")
+        debug(f"  Headers: {hdrs}")
+        debug(f"  Body:    {json.dumps(body, sort_keys=True)}")
+        return requests.post(url, json=body, headers=hdrs, timeout=15)
+    else:  # get
+        debug(f"  REQUEST: GET {url}?{_ue(sorted(body.items()))}")
+        return requests.get(url, params=body, timeout=15)
 
-    if algo == "hmac-sha256":
-        return hmac.new(
-            key=app_secret.encode(), msg=msg.encode(), digestmod=hashlib.sha256
-        ).hexdigest().upper()
-    else:  # md5
-        return hashlib.md5(msg.encode()).hexdigest().upper()
+
+def _is_incomplete_sig(data: dict) -> bool:
+    return "IncompleteSignature" in str(data.get("code", "")) or \
+           "IncompleteSignature" in str(data.get("error_code", ""))
 
 
 def exchange_code(code: str, app_key: str, app_secret: str) -> dict:
     """
     Wymiana authorization code na Access Token.
-    Probuje kolejno wszystkie sensowne kombinacje podpisu i transport
-    az do pierwszej odpowiedzi INNEJ niz IncompleteSignature.
+
+    Probuje kolejno:
+      1. Standardowy OAuth 2.0 (bez custom podpisu AliExpress) — NOWY
+      2. Wszystkie warianty custom podpisu (HMAC/MD5, rozne param-sety)
+      3. Warianty z path-prefix w base stringu
+      4. Wariant z redirect_uri w podpisie
+
+    Drukuje pelny request body i naglowki HTTP dla kazdej proby.
     """
     rest_url = "https://api-sg.aliexpress.com/rest/auth/token/create"
+    redirect_uri = os.getenv("ALIEXPRESS_REDIRECT_URI", "")
     timestamp = str(int(time.time() * 1000))
-
-    # ----------------------------------------------------------------
-    # Zestawy parametrow do podpisania — moze sign_method tez wchodzi
-    # ----------------------------------------------------------------
-    base_params = {
-        "app_key": app_key,
-        "code": code,
-        "grant_type": "authorization_code",
-        "timestamp": timestamp,
-    }
-    base_params_with_sm = {**base_params, "sign_method": "sha256"}
-
-    def params_str(p: dict) -> str:
-        return "".join(f"{k}{v}" for k, v in sorted(p.items()))
-
-    ps_base = params_str(base_params)
-    ps_with_sm = params_str(base_params_with_sm)
-
-    # ----------------------------------------------------------------
-    # Wszystkie warianty: (etykieta, params_do_podpisu, algo, wrap)
-    # ----------------------------------------------------------------
-    sign_variants = [
-        ("1: HMAC-SHA256 | 4 params | SECRET+p+SECRET", ps_base,    "hmac-sha256", "both"),
-        ("2: HMAC-SHA256 | 4 params | SECRET+p",        ps_base,    "hmac-sha256", "prefix"),
-        ("3: HMAC-SHA256 | 4 params | p only",           ps_base,    "hmac-sha256", "none"),
-        ("4: HMAC-SHA256 | 5 params+sm | SECRET+p+S",   ps_with_sm, "hmac-sha256", "both"),
-        ("5: HMAC-SHA256 | 5 params+sm | SECRET+p",     ps_with_sm, "hmac-sha256", "prefix"),
-        ("6: HMAC-SHA256 | 5 params+sm | p only",        ps_with_sm, "hmac-sha256", "none"),
-        ("7: MD5         | 4 params | SECRET+p+SECRET",  ps_base,    "md5",         "both"),
-        ("8: MD5         | 4 params | SECRET+p",         ps_base,    "md5",         "prefix"),
-        ("9: MD5         | 4 params | p only",            ps_base,    "md5",         "none"),
-    ]
-
-    debug("=" * 56)
-    debug("WARIANTY PODPISU (params w kolejnosci alfabetycznej):")
-    debug(f"  4-params string: {ps_base[:80]}")
-    debug(f"  5-params string: {ps_with_sm[:80]}")
-    all_sigs = {}
-    for label, ps, algo, wrap in sign_variants:
-        s = _make_sign(ps, app_secret, algo, wrap)
-        all_sigs[label] = s
-        debug(f"  [{label}]")
-        debug(f"    => {s}")
-    debug("=" * 56)
-
-    # ----------------------------------------------------------------
-    # Transport: probuj POST body i GET query string
-    # ----------------------------------------------------------------
-    transport_variants = [
-        ("POST body | Content-Type: form",        "post_form"),
-        ("POST body | Content-Type: json",         "post_json"),
-        ("GET query string",                       "get"),
-    ]
 
     info(f"Endpoint: {rest_url}")
     info(f"app_key={app_key}  timestamp={timestamp}  code={code[:12]}...")
-
     last_response: dict = {}
 
-    for sign_label, ps, algo, wrap in sign_variants:
-        sign = all_sigs[sign_label]
-        body = {
-            **base_params,
-            "sign_method": "sha256",
-            "sign": sign,
+    def try_request(label: str, body: dict, mode: str) -> dict | None:
+        nonlocal last_response
+        debug(f"--- Proba [{label}] [{mode}] ---")
+        try:
+            resp = _do_request(rest_url, body, mode)
+        except requests.RequestException as e:
+            debug(f"  => HTTP error: {e}")
+            return None
+        debug(f"  RESPONSE: HTTP {resp.status_code}")
+        debug(f"  Body:     {resp.text[:400]}")
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {"raw": resp.text}
+        last_response = data
+        if not _is_incomplete_sig(data) and resp.status_code == 200:
+            info(f"TRAFIONY WARIANT: [{label}] [{mode}]")
+            return data
+        return None
+
+    # ================================================================
+    # WARIANT 0: Standardowy OAuth 2.0 — BEZ custom podpisu AliExpress
+    # Endpoint REST moze akceptowac client_id/client_secret zamiast sign
+    # ================================================================
+    debug("=" * 56)
+    debug("WARIANT 0: Standardowy OAuth 2.0 (brak custom sign)")
+    debug("=" * 56)
+    for mode in ("post_form", "get"):
+        oauth2_body = {
+            "code": code,
+            "grant_type": "authorization_code",
+            "client_id": app_key,
+            "client_secret": app_secret,
         }
+        if redirect_uri:
+            oauth2_body["redirect_uri"] = redirect_uri
+        result = try_request("OAuth2 standard", oauth2_body, mode)
+        if result is not None:
+            return result
 
-        for trans_label, trans_mode in transport_variants:
-            debug(f"Proba: [{sign_label}] + [{trans_label}]")
+    # ================================================================
+    # WARIANT 1-9: Custom podpis AliExpress (HMAC/MD5, rozne zestawy)
+    # ================================================================
+    def ps(p: dict) -> str:
+        return "".join(f"{k}{v}" for k, v in sorted(p.items()))
 
-            try:
-                if trans_mode == "post_form":
-                    resp = requests.post(
-                        rest_url, data=body, timeout=15,
-                        headers={"Content-Type": "application/x-www-form-urlencoded"},
-                    )
-                elif trans_mode == "post_json":
-                    resp = requests.post(
-                        rest_url, json=body, timeout=15,
-                        headers={"Content-Type": "application/json"},
-                    )
-                else:  # get
-                    resp = requests.get(rest_url, params=body, timeout=15)
-            except requests.RequestException as e:
-                debug(f"  => HTTP error: {e}")
-                continue
+    p4 = {"app_key": app_key, "code": code,
+          "grant_type": "authorization_code", "timestamp": timestamp}
+    p5 = {**p4, "sign_method": "sha256"}
+    p5r = {**p4, "redirect_uri": redirect_uri} if redirect_uri else p4
+    path = "/rest/auth/token/create"
 
-            raw = resp.text[:300]
-            debug(f"  => HTTP {resp.status_code} | {raw}")
+    sign_sets = [
+        # etykieta,          params_str,              base_prefix, base_suffix, algo
+        ("1: HMAC 4p S+p+S", ps(p4),                  app_secret,  app_secret,  "h"),
+        ("2: HMAC 4p S+p",   ps(p4),                  app_secret,  "",          "h"),
+        ("3: HMAC 4p p",     ps(p4),                  "",          "",          "h"),
+        ("4: HMAC 5p S+p+S", ps(p5),                  app_secret,  app_secret,  "h"),
+        ("5: HMAC 5p S+p",   ps(p5),                  app_secret,  "",          "h"),
+        ("6: HMAC 5p p",     ps(p5),                  "",          "",          "h"),
+        ("7: MD5  4p S+p+S", ps(p4),                  app_secret,  app_secret,  "m"),
+        ("8: MD5  4p S+p",   ps(p4),                  app_secret,  "",          "m"),
+        ("9: MD5  4p p",     ps(p4),                  "",          "",          "m"),
+        # z path-prefix
+        ("10: HMAC path+4p", path + ps(p4),            "",          "",          "h"),
+        ("11: HMAC path+5p", path + ps(p5),            "",          "",          "h"),
+        ("12: MD5  path+4p", path + ps(p4),            "",          "",          "m"),
+        # z redirect_uri w parametrach
+        ("13: HMAC 4p+redir", ps(p5r),                app_secret,  app_secret,  "h"),
+    ]
 
-            try:
-                data = resp.json()
-            except ValueError:
-                data = {"raw": resp.text}
+    debug("=" * 56)
+    debug("WARIANTY 1-13: Custom podpis AliExpress")
+    debug("=" * 56)
 
-            last_response = data
+    for label, msg_str, prefix, suffix, algo in sign_sets:
+        base = prefix + msg_str + suffix
+        if algo == "h":
+            sign = hmac.new(
+                key=app_secret.encode(), msg=base.encode(),
+                digestmod=hashlib.sha256,
+            ).hexdigest().upper()
+        else:
+            sign = hashlib.md5(base.encode()).hexdigest().upper()
+        debug(f"  [{label}] base[0:80]={base[:80]}  sign={sign}")
 
-            # Jesli NIE ma IncompleteSignature — to jest nasz wariant
-            error_code = data.get("code", "") or data.get("error_code", "")
-            if "IncompleteSignature" not in str(error_code) and resp.status_code == 200:
-                info(f"TRAFIONY WARIANT: [{sign_label}] + [{trans_label}]")
-                return data
+        body = {**p4, "sign_method": "sha256", "sign": sign}
 
-    info("Zaden wariant nie przeszedl — zwracam ostatnia odpowiedz")
+        for mode in ("post_form", "get"):
+            result = try_request(label, body, mode)
+            if result is not None:
+                return result
+
+    info("Zaden z wariantow nie zwrocil sukcesu.")
+    info("Pelna ostatnia odpowiedz powyzej w [DBG].")
     return last_response
 
 
