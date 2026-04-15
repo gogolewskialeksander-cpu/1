@@ -32,7 +32,7 @@ from dotenv import load_dotenv
 
 
 # ===== ENDPOINTY =====
-OAUTH_URL = "https://oauth.aliexpress.com/authorize"
+OAUTH_URL = "https://api-sg.aliexpress.com/oauth/authorize"
 SYNC_URL = "https://api-sg.aliexpress.com/sync"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -128,11 +128,10 @@ def generate_oauth_url(app_key: str, redirect_uri: str) -> str:
     """
     params = {
         "response_type": "code",
+        "force_auth": "true",
         "client_id": app_key,
         "redirect_uri": redirect_uri,
         "state": "ds_auth",
-        "sp": "ae",
-        "view": "web",
     }
     # urlencode domyslnie koduje wartosci (np. https:// -> https%3A%2F%2F)
     url = OAUTH_URL + "?" + urlencode(params)
