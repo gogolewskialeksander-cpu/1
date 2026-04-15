@@ -25,9 +25,9 @@ import requests
 from logger import Logger
 
 
-API_URL: str = "https://api-sg.aliexpress.com/sync"
-API_VERSION: str = "2.0"
+API_URL: str = "https://api-sg.aliexpress.com/rest"
 SIGN_METHOD: str = "sha256"
+PARTNER_ID: str = "iop-sdk-python-20220609"
 DAILY_REQUEST_LIMIT: int = 1000
 REQUEST_TIMEOUT_SECONDS: int = 30
 
@@ -102,14 +102,16 @@ class AliExpressClient:
         self._session = requests.Session()
         self._request_count: int = 0
 
-    def _build_signature(self, params: Dict[str, str]) -> str:
+    def _build_signature(self, method: str, params: Dict[str, str]) -> str:
         """
-        Oblicza HMAC-SHA256 ze wszystkich parametrow (posortowanych alfabetycznie).
+        Oblicza HMAC-SHA256 zgodnie z oficjalnym IOP SDK AliExpress.
 
-        Format bazowy: klucz1wartosc1klucz2wartosc2...
+        Format bazowy: method + klucz1wartosc1klucz2wartosc2...
+        (params posortowane alfabetycznie, bez pola 'sign')
+        Klucz HMAC = app_secret
         """
-        sorted_items = sorted(params.items())
-        base_string = "".join(f"{k}{v}" for k, v in sorted_items)
+        sorted_items = sorted((k, v) for k, v in params.items() if k != "sign")
+        base_string = method + "".join(f"{k}{v}" for k, v in sorted_items)
         signature = hmac.new(
             key=self.app_secret.encode("utf-8"),
             msg=base_string.encode("utf-8"),
@@ -140,15 +142,16 @@ class AliExpressClient:
                 f"Osiagnieto dzienny limit {DAILY_REQUEST_LIMIT} requestow do AliExpress."
             )
 
-        # Parametry systemowe
+        # Parametry systemowe — format IOP SDK (partner_id, sec+'000' timestamp)
         params: Dict[str, str] = {
-            "method": method,
             "app_key": self.app_key,
-            "session": self.access_token,
-            "timestamp": str(int(time.time() * 1000)),
-            "format": "json",
-            "v": API_VERSION,
             "sign_method": SIGN_METHOD,
+            "timestamp": str(int(round(time.time()))) + "000",
+            "partner_id": PARTNER_ID,
+            "method": method,
+            "simplify": "false",
+            "format": "json",
+            "session": self.access_token,
         }
         # Dokladamy parametry metody (zawsze jako string do podpisu)
         for key, value in method_params.items():
@@ -157,7 +160,7 @@ class AliExpressClient:
             else:
                 params[key] = str(value)
 
-        params["sign"] = self._build_signature(params)
+        params["sign"] = self._build_signature(method, params)
 
         backoff_seconds: float = 2.0
         last_error: Optional[Exception] = None
@@ -240,54 +243,76 @@ class AliExpressClient:
         self,
         ship_from_countries: List[str],
         limit: int,
-        keyword: str = "",
+        keyword: str = "phone holder",
     ) -> List[str]:
         """
-        Zwraca liste product_id spelniajace kryterium magazynu europejskiego.
+        Zwraca liste product_id przez aliexpress.ds.product.search.
 
-        Uzywa metody aliexpress.ds.recommend.feed.get (zalecane produkty dla
-        dropshipperow) i filtruje wyniki po `ship_from_country`.
+        Filtruje wyniki po `ship_from_country` (magazyn EU) jesli
+        to pole jest dostepne w odpowiedzi wyszukiwarki.
 
         Args:
             ship_from_countries: Lista kodow krajow EU (np. ['PL', 'DE']).
             limit: Maksymalna liczba produktow do pobrania.
-            keyword: Opcjonalne slowo kluczowe do wyszukiwania.
+            keyword: Slowo kluczowe do wyszukiwania.
 
         Returns:
             Lista identyfikatorow produktow.
         """
+        eu_set = {c.upper() for c in ship_from_countries}
         product_ids: List[str] = []
         page_no = 1
-        page_size = min(50, limit)
+        page_size = min(20, limit)
 
         while len(product_ids) < limit:
             response = self._call(
-                "aliexpress.ds.recommend.feed.get",
+                "aliexpress.ds.product.search",
                 {
-                    "feed_name": "DS_bestseller_en",
+                    "keywords": keyword,
+                    "local_country": "PL",
+                    "ship_to_country": "PL",
+                    "local_currency": "PLN",
+                    "local_language": "PL",
                     "page_no": page_no,
                     "page_size": page_size,
-                    "country": "PL",
-                    "target_currency": "PLN",
-                    "target_language": "EN",
-                    "ship_from_countries": ",".join(ship_from_countries),
+                    "sort": "SALE_PRICE_ASC",
                 },
             )
 
-            # Struktura odpowiedzi: aliexpress_ds_recommend_feed_get_response -> result -> products
-            root = response.get("aliexpress_ds_recommend_feed_get_response", {})
+            # Odpowiedz: aliexpress_ds_product_search_response -> result
+            root = response.get("aliexpress_ds_product_search_response", {})
             result = root.get("result", {})
-            products = result.get("products", {}).get("traffic_product_d_t_o", [])
+
+            # Produkty moga byc w roznych miejscach w zaleznosci od wersji API
+            products: List[Dict[str, Any]] = []
+            if isinstance(result.get("products"), list):
+                products = result["products"]
+            elif isinstance(result.get("products"), dict):
+                products = result["products"].get("product", [])
+            elif isinstance(result.get("search_product_list"), dict):
+                products = result["search_product_list"].get("product", [])
+
             if not products:
+                self.logger.warn(
+                    f"aliexpress.ds.product.search strona {page_no}: brak produktow. "
+                    f"Surowa odpowiedz: {str(root)[:300]}"
+                )
                 break
 
             for p in products:
                 pid = str(p.get("product_id", ""))
-                if pid:
-                    product_ids.append(pid)
+                if not pid:
+                    continue
+                # Filtruj po magazynie EU jesli pole dostepne
+                ship_from = str(p.get("ship_from_country", "")).upper()
+                if ship_from and eu_set and ship_from not in eu_set:
+                    continue
+                product_ids.append(pid)
                 if len(product_ids) >= limit:
                     break
 
+            if len(product_ids) >= limit:
+                break
             if len(products) < page_size:
                 break
             page_no += 1
