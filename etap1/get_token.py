@@ -142,115 +142,136 @@ def generate_oauth_url(app_key: str, redirect_uri: str) -> str:
 # Krok 3 — Wymiana code na Access Token
 # ---------------------------------------------------------------------------
 
-def _all_sign_variants(sign_params: dict, app_secret: str) -> dict[str, str]:
-    """
-    Generuje wszystkie mozliwe warianty podpisu dla REST endpointu.
-    Zwraca slownik {nazwa_wariantu: podpis}.
-    """
-    import hashlib as _hl
-    import hmac as _hm
+def _make_sign(params_str: str, app_secret: str, algo: str, wrap: str) -> str:
+    """Generuje jeden wariant podpisu."""
+    if wrap == "both":
+        msg = app_secret + params_str + app_secret
+    elif wrap == "prefix":
+        msg = app_secret + params_str
+    else:
+        msg = params_str
 
-    sorted_items = sorted(sign_params.items())
-    params_str = "".join(f"{k}{v}" for k, v in sorted_items)
-
-    variants: dict[str, str] = {}
-
-    # Wariant A: HMAC-SHA256, msg = SECRET + params + SECRET
-    base_a = app_secret + params_str + app_secret
-    variants["A: HMAC-SHA256 (SECRET+params+SECRET)"] = _hm.new(
-        key=app_secret.encode(), msg=base_a.encode(), digestmod=_hl.sha256
-    ).hexdigest().upper()
-
-    # Wariant B: HMAC-SHA256, msg = SECRET + params (bez konczacego SECRET)
-    base_b = app_secret + params_str
-    variants["B: HMAC-SHA256 (SECRET+params)"] = _hm.new(
-        key=app_secret.encode(), msg=base_b.encode(), digestmod=_hl.sha256
-    ).hexdigest().upper()
-
-    # Wariant C: HMAC-SHA256, msg = params only (standard TOP API)
-    variants["C: HMAC-SHA256 (params only)"] = _hm.new(
-        key=app_secret.encode(), msg=params_str.encode(), digestmod=_hl.sha256
-    ).hexdigest().upper()
-
-    # Wariant D: MD5, msg = SECRET + params + SECRET
-    import hashlib as _hl2
-    variants["D: MD5 (SECRET+params+SECRET)"] = _hl2.md5(
-        (app_secret + params_str + app_secret).encode()
-    ).hexdigest().upper()
-
-    # Wariant E: MD5, msg = params only
-    variants["E: MD5 (params only)"] = _hl2.md5(
-        params_str.encode()
-    ).hexdigest().upper()
-
-    return variants
+    if algo == "hmac-sha256":
+        return hmac.new(
+            key=app_secret.encode(), msg=msg.encode(), digestmod=hashlib.sha256
+        ).hexdigest().upper()
+    else:  # md5
+        return hashlib.md5(msg.encode()).hexdigest().upper()
 
 
 def exchange_code(code: str, app_key: str, app_secret: str) -> dict:
     """
-    Wymiana authorization code na Access Token przez REST endpoint.
-
-    Endpoint: POST https://api-sg.aliexpress.com/rest/auth/token/create
-
-    Drukuje wszystkie warianty podpisu w [DBG] — po zobaczeniu ktory
-    zwroci sukces zamiast IncompleteSignature, zaktualizuj skrypt.
-    Aktualnie uzywa wariantu A (SECRET+params+SECRET, HMAC-SHA256).
+    Wymiana authorization code na Access Token.
+    Probuje kolejno wszystkie sensowne kombinacje podpisu i transport
+    az do pierwszej odpowiedzi INNEJ niz IncompleteSignature.
     """
     rest_url = "https://api-sg.aliexpress.com/rest/auth/token/create"
     timestamp = str(int(time.time() * 1000))
 
-    # Parametry do podpisania (posortowane alfabetycznie: a, c, g, t)
-    sign_params: dict[str, str] = {
+    # ----------------------------------------------------------------
+    # Zestawy parametrow do podpisania — moze sign_method tez wchodzi
+    # ----------------------------------------------------------------
+    base_params = {
         "app_key": app_key,
         "code": code,
         "grant_type": "authorization_code",
         "timestamp": timestamp,
     }
+    base_params_with_sm = {**base_params, "sign_method": "sha256"}
 
-    # Pokaz wszystkie warianty podpisu
-    sorted_items = sorted(sign_params.items())
-    params_str = "".join(f"{k}{v}" for k, v in sorted_items)
-    debug(f"Params string: {params_str[:100]}")
-    debug(f"Kolejnosc (alfabetyczna): {[k for k, _ in sorted_items]}")
+    def params_str(p: dict) -> str:
+        return "".join(f"{k}{v}" for k, v in sorted(p.items()))
 
-    variants = _all_sign_variants(sign_params, app_secret)
-    debug("=" * 50)
-    debug("WSZYSTKIE WARIANTY PODPISU:")
-    for name, sig in variants.items():
-        debug(f"  {name}")
-        debug(f"    => {sig}")
-    debug("=" * 50)
+    ps_base = params_str(base_params)
+    ps_with_sm = params_str(base_params_with_sm)
 
-    # Uzywamy wariantu A — zmien jesli inny wariant zadziala
-    active_variant = "A: HMAC-SHA256 (SECRET+params+SECRET)"
-    sign = variants[active_variant]
-    debug(f"Aktywny wariant: {active_variant}")
+    # ----------------------------------------------------------------
+    # Wszystkie warianty: (etykieta, params_do_podpisu, algo, wrap)
+    # ----------------------------------------------------------------
+    sign_variants = [
+        ("1: HMAC-SHA256 | 4 params | SECRET+p+SECRET", ps_base,    "hmac-sha256", "both"),
+        ("2: HMAC-SHA256 | 4 params | SECRET+p",        ps_base,    "hmac-sha256", "prefix"),
+        ("3: HMAC-SHA256 | 4 params | p only",           ps_base,    "hmac-sha256", "none"),
+        ("4: HMAC-SHA256 | 5 params+sm | SECRET+p+S",   ps_with_sm, "hmac-sha256", "both"),
+        ("5: HMAC-SHA256 | 5 params+sm | SECRET+p",     ps_with_sm, "hmac-sha256", "prefix"),
+        ("6: HMAC-SHA256 | 5 params+sm | p only",        ps_with_sm, "hmac-sha256", "none"),
+        ("7: MD5         | 4 params | SECRET+p+SECRET",  ps_base,    "md5",         "both"),
+        ("8: MD5         | 4 params | SECRET+p",         ps_base,    "md5",         "prefix"),
+        ("9: MD5         | 4 params | p only",            ps_base,    "md5",         "none"),
+    ]
 
-    params: dict[str, str] = {
-        "app_key": app_key,
-        "code": code,
-        "grant_type": "authorization_code",
-        "timestamp": timestamp,
-        "sign_method": "sha256",
-        "sign": sign,
-    }
+    debug("=" * 56)
+    debug("WARIANTY PODPISU (params w kolejnosci alfabetycznej):")
+    debug(f"  4-params string: {ps_base[:80]}")
+    debug(f"  5-params string: {ps_with_sm[:80]}")
+    all_sigs = {}
+    for label, ps, algo, wrap in sign_variants:
+        s = _make_sign(ps, app_secret, algo, wrap)
+        all_sigs[label] = s
+        debug(f"  [{label}]")
+        debug(f"    => {s}")
+    debug("=" * 56)
 
-    info(f"Endpoint: POST {rest_url}")
+    # ----------------------------------------------------------------
+    # Transport: probuj POST body i GET query string
+    # ----------------------------------------------------------------
+    transport_variants = [
+        ("POST body | Content-Type: form",        "post_form"),
+        ("POST body | Content-Type: json",         "post_json"),
+        ("GET query string",                       "get"),
+    ]
+
+    info(f"Endpoint: {rest_url}")
     info(f"app_key={app_key}  timestamp={timestamp}  code={code[:12]}...")
 
-    resp = requests.post(
-        rest_url,
-        data=params,
-        timeout=30,
-    )
+    last_response: dict = {}
 
-    info(f"HTTP status: {resp.status_code}")
-    debug(f"Surowa odpowiedz: {resp.text[:600]}")
+    for sign_label, ps, algo, wrap in sign_variants:
+        sign = all_sigs[sign_label]
+        body = {
+            **base_params,
+            "sign_method": "sha256",
+            "sign": sign,
+        }
 
-    try:
-        return resp.json()
-    except ValueError:
-        return {"raw": resp.text, "error": "Nie-JSON odpowiedz"}
+        for trans_label, trans_mode in transport_variants:
+            debug(f"Proba: [{sign_label}] + [{trans_label}]")
+
+            try:
+                if trans_mode == "post_form":
+                    resp = requests.post(
+                        rest_url, data=body, timeout=15,
+                        headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    )
+                elif trans_mode == "post_json":
+                    resp = requests.post(
+                        rest_url, json=body, timeout=15,
+                        headers={"Content-Type": "application/json"},
+                    )
+                else:  # get
+                    resp = requests.get(rest_url, params=body, timeout=15)
+            except requests.RequestException as e:
+                debug(f"  => HTTP error: {e}")
+                continue
+
+            raw = resp.text[:300]
+            debug(f"  => HTTP {resp.status_code} | {raw}")
+
+            try:
+                data = resp.json()
+            except ValueError:
+                data = {"raw": resp.text}
+
+            last_response = data
+
+            # Jesli NIE ma IncompleteSignature — to jest nasz wariant
+            error_code = data.get("code", "") or data.get("error_code", "")
+            if "IncompleteSignature" not in str(error_code) and resp.status_code == 200:
+                info(f"TRAFIONY WARIANT: [{sign_label}] + [{trans_label}]")
+                return data
+
+    info("Zaden wariant nie przeszedl — zwracam ostatnia odpowiedz")
+    return last_response
 
 
 # ---------------------------------------------------------------------------
