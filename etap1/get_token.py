@@ -9,20 +9,17 @@ Kroki:
     1. Czyta APP_KEY / APP_SECRET z pliku .env
     2. Generuje URL autoryzacji i otwiera go w przegladarce
     3. Czeka az uzytkownik wklei authorization code z URL callback
-    4. Wymienia code na Access Token (endpoint: /rest/auth/token/create)
+    4. Wymienia code na Access Token (IOP SDK, endpoint /auth/token/create)
     5. Zapisuje Access Token do .env (ALIEXPRESS_ACCESS_TOKEN)
 
 Jesli przeglądarka sie nie otworzy automatycznie, skopiuj URL recznie.
 """
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import os
 import re
 import sys
-import time
 import webbrowser
 from pathlib import Path
 from urllib.parse import urlencode
@@ -30,10 +27,14 @@ from urllib.parse import urlencode
 import requests
 from dotenv import load_dotenv
 
+# IOP SDK — oficjalny klient AliExpress Open Platform
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import iop
+
 
 # ===== ENDPOINTY =====
 OAUTH_URL = "https://api-sg.aliexpress.com/oauth/authorize"
-SYNC_URL = "https://api-sg.aliexpress.com/sync"
+IOP_GATEWAY = "https://api-sg.aliexpress.com"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 ENV_PATH = SCRIPT_DIR / ".env"
@@ -61,36 +62,6 @@ def fail(msg: str) -> None:
     print(f"  [FAIL] {msg}", file=sys.stderr)
 
 
-def debug(msg: str) -> None:
-    print(f"  [DBG]  {msg}")
-
-
-# ---------------------------------------------------------------------------
-# Podpis HMAC-SHA256 (identyczny z aliexpress_client._build_signature)
-# ---------------------------------------------------------------------------
-
-def build_signature(params: dict[str, str], app_secret: str) -> str:
-    """
-    Generuje podpis HMAC-SHA256 dla AliExpress TOP API.
-
-    Algorytm:
-        1. Posortuj parametry alfabetycznie po kluczu.
-        2. Sklej: klucz1wartosc1klucz2wartosc2...
-        3. HMAC-SHA256 z app_secret jako kluczem.
-        4. Zwroc wielkie litery (uppercase HEX).
-    """
-    sorted_items = sorted(params.items())
-    base_string = "".join(f"{k}{v}" for k, v in sorted_items)
-    debug(f"Base string (pierwsze 120 zn.): {base_string[:120]}")
-    sig = hmac.new(
-        key=app_secret.encode("utf-8"),
-        msg=base_string.encode("utf-8"),
-        digestmod=hashlib.sha256,
-    ).hexdigest().upper()
-    debug(f"HMAC-SHA256: {sig}")
-    return sig
-
-
 # ---------------------------------------------------------------------------
 # Krok 1 — Zaladowanie danych z .env
 # ---------------------------------------------------------------------------
@@ -115,17 +86,6 @@ def load_credentials() -> tuple[str, str, str]:
 # ---------------------------------------------------------------------------
 
 def generate_oauth_url(app_key: str, redirect_uri: str) -> str:
-    """
-    Buduje URL autoryzacji OAuth AliExpress.
-
-    Parametry zgodne z dokumentacja AliExpress TOP OAuth:
-      response_type  = code
-      client_id      = app_key
-      redirect_uri   = callback URL z panelu aplikacji
-      state          = dowolny string (ochrona CSRF)
-      sp             = ae  (wymagane dla AliExpress, odroznenie od innych platform)
-      view           = web (opcjonalne — wymuszone widok desktopowy)
-    """
     params = {
         "response_type": "code",
         "force_auth": "true",
@@ -133,396 +93,45 @@ def generate_oauth_url(app_key: str, redirect_uri: str) -> str:
         "redirect_uri": redirect_uri,
         "state": "ds_auth",
     }
-    # urlencode domyslnie koduje wartosci (np. https:// -> https%3A%2F%2F)
-    url = OAUTH_URL + "?" + urlencode(params)
-    return url
+    return OAUTH_URL + "?" + urlencode(params)
 
 
 # ---------------------------------------------------------------------------
-# Krok 3 — Wymiana code na Access Token
+# Krok 3 — Wymiana code na Access Token przez IOP SDK
 # ---------------------------------------------------------------------------
 
-def _do_request(url: str, body: dict, mode: str) -> requests.Response:
-    """Wysyla request i drukuje pelny request body + naglowki."""
-    from urllib.parse import urlencode as _ue
-    if mode == "post_form":
-        hdrs = {"Content-Type": "application/x-www-form-urlencoded"}
-        debug(f"  REQUEST: POST {url}")
-        debug(f"  Headers: {hdrs}")
-        debug(f"  Body:    {_ue(sorted(body.items()))}")
-        return requests.post(url, data=body, headers=hdrs, timeout=15)
-    elif mode == "post_json":
-        hdrs = {"Content-Type": "application/json"}
-        debug(f"  REQUEST: POST {url}")
-        debug(f"  Headers: {hdrs}")
-        debug(f"  Body:    {json.dumps(body, sort_keys=True)}")
-        return requests.post(url, json=body, headers=hdrs, timeout=15)
-    else:  # get
-        debug(f"  REQUEST: GET {url}?{_ue(sorted(body.items()))}")
-        return requests.get(url, params=body, timeout=15)
-
-
-def _is_incomplete_sig(data: dict) -> bool:
-    return "IncompleteSignature" in str(data.get("code", "")) or \
-           "IncompleteSignature" in str(data.get("error_code", ""))
-
-
-def exchange_code(code: str, app_key: str, app_secret: str) -> dict:
+def exchange_code(code: str, app_key: str, app_secret: str) -> iop.IopResponse:
     """
-    Wymiana authorization code na Access Token.
+    Wymienia authorization code na Access Token uzywajac oficjalnego IOP SDK.
 
-    Probuje kolejno:
-      1. Standardowy OAuth 2.0 (bez custom podpisu AliExpress) — NOWY
-      2. Wszystkie warianty custom podpisu (HMAC/MD5, rozne param-sety)
-      3. Warianty z path-prefix w base stringu
-      4. Wariant z redirect_uri w podpisie
-
-    Drukuje pelny request body i naglowki HTTP dla kazdej proby.
+    Oficjalny algorytm podpisu:
+      timestamp = str(int(round(time.time()))) + '000'
+      params = {app_key, sign_method=sha256, timestamp,
+                partner_id=iop-sdk-python-20220609,
+                method=/auth/token/create, simplify=false, format=json,
+                code=CODE}
+      base = '/auth/token/create' + concat(sorted(params), key+value)
+      sign = HMAC-SHA256(key=app_secret, msg=base).hexdigest().upper()
+      POST https://api-sg.aliexpress.com/auth/token/create
     """
-    rest_url = "https://api-sg.aliexpress.com/rest/auth/token/create"
-    redirect_uri = os.getenv("ALIEXPRESS_REDIRECT_URI", "")
-    timestamp = str(int(time.time() * 1000))
+    client = iop.IopClient(IOP_GATEWAY, app_key, app_secret)
+    request = iop.IopRequest("/auth/token/create")
+    request.add_api_param("code", code)
 
-    info(f"Endpoint: {rest_url}")
-    info(f"app_key={app_key}  timestamp={timestamp}  code={code[:12]}...")
-    last_response: dict = {}
+    info(f"IOP gateway: {IOP_GATEWAY}")
+    info(f"API path:    /auth/token/create")
+    info(f"code:        {code[:12]}...")
 
-    def try_request(label: str, body: dict, mode: str) -> dict | None:
-        nonlocal last_response
-        debug(f"--- Proba [{label}] [{mode}] ---")
-        try:
-            resp = _do_request(rest_url, body, mode)
-        except requests.RequestException as e:
-            debug(f"  => HTTP error: {e}")
-            return None
-        debug(f"  RESPONSE: HTTP {resp.status_code}")
-        debug(f"  Body:     {resp.text[:400]}")
-        try:
-            data = resp.json()
-        except ValueError:
-            data = {"raw": resp.text}
-        last_response = data
-        # Sukces tylko jesli odpowiedz zawiera access_token
-        if resp.status_code == 200 and data.get("access_token"):
-            info(f"TRAFIONY WARIANT: [{label}] [{mode}]")
-            return data
-        return None
+    response = client.execute(request)
 
-    # ================================================================
-    # WARIANT 0a: app_key (nie client_id) + app_secret, bez podpisu
-    # Odpowiedz powiedzila ze brakuje app_key — uzywamy app_key
-    # ================================================================
-    debug("=" * 56)
-    debug("WARIANTY BEZ CUSTOM SIGN (rozne kombinacje app_key)")
-    debug("=" * 56)
+    info(f"HTTP odpowiedz: {response._raw.status_code}")
+    print(f"\n  Pelna odpowiedz:\n  {json.dumps(response.body, indent=4, ensure_ascii=False)}")
 
-    no_sign_variants = [
-        # etykieta, body
-        ("0a: app_key + app_secret", {
-            "app_key": app_key, "app_secret": app_secret,
-            "code": code, "grant_type": "authorization_code",
-        }),
-        ("0b: app_key + app_secret + redirect_uri", {
-            "app_key": app_key, "app_secret": app_secret,
-            "code": code, "grant_type": "authorization_code",
-            "redirect_uri": redirect_uri,
-        }),
-        ("0c: app_key tylko (bez secret)", {
-            "app_key": app_key,
-            "code": code, "grant_type": "authorization_code",
-        }),
-        ("0d: app_key + client_secret", {
-            "app_key": app_key, "client_secret": app_secret,
-            "code": code, "grant_type": "authorization_code",
-        }),
-        ("0e: app_key + timestamp (bez sign)", {
-            "app_key": app_key, "timestamp": timestamp,
-            "code": code, "grant_type": "authorization_code",
-        }),
-    ]
-
-    for label, body in no_sign_variants:
-        for mode in ("post_form", "get"):
-            result = try_request(label, body, mode)
-            if result is not None:
-                return result
-
-    # ================================================================
-    # WARIANT 1-9: Custom podpis AliExpress (HMAC/MD5, rozne zestawy)
-    # ================================================================
-    def ps(p: dict) -> str:
-        return "".join(f"{k}{v}" for k, v in sorted(p.items()))
-
-    p4 = {"app_key": app_key, "code": code,
-          "grant_type": "authorization_code", "timestamp": timestamp}
-    p5 = {**p4, "sign_method": "sha256"}
-    p5r = {**p4, "redirect_uri": redirect_uri} if redirect_uri else p4
-    path = "/rest/auth/token/create"
-
-    sign_sets = [
-        # etykieta,          params_str,              base_prefix, base_suffix, algo
-        ("1: HMAC 4p S+p+S", ps(p4),                  app_secret,  app_secret,  "h"),
-        ("2: HMAC 4p S+p",   ps(p4),                  app_secret,  "",          "h"),
-        ("3: HMAC 4p p",     ps(p4),                  "",          "",          "h"),
-        ("4: HMAC 5p S+p+S", ps(p5),                  app_secret,  app_secret,  "h"),
-        ("5: HMAC 5p S+p",   ps(p5),                  app_secret,  "",          "h"),
-        ("6: HMAC 5p p",     ps(p5),                  "",          "",          "h"),
-        ("7: MD5  4p S+p+S", ps(p4),                  app_secret,  app_secret,  "m"),
-        ("8: MD5  4p S+p",   ps(p4),                  app_secret,  "",          "m"),
-        ("9: MD5  4p p",     ps(p4),                  "",          "",          "m"),
-        # z path-prefix
-        ("10: HMAC path+4p", path + ps(p4),            "",          "",          "h"),
-        ("11: HMAC path+5p", path + ps(p5),            "",          "",          "h"),
-        ("12: MD5  path+4p", path + ps(p4),            "",          "",          "m"),
-        # z redirect_uri w parametrach
-        ("13: HMAC 4p+redir", ps(p5r),                app_secret,  app_secret,  "h"),
-    ]
-
-    debug("=" * 56)
-    debug("WARIANTY 1-13: Custom podpis AliExpress")
-    debug("=" * 56)
-
-    for label, msg_str, prefix, suffix, algo in sign_sets:
-        base = prefix + msg_str + suffix
-        if algo == "h":
-            sign = hmac.new(
-                key=app_secret.encode(), msg=base.encode(),
-                digestmod=hashlib.sha256,
-            ).hexdigest().upper()
-        else:
-            sign = hashlib.md5(base.encode()).hexdigest().upper()
-        debug(f"  [{label}] base[0:80]={base[:80]}  sign={sign}")
-
-        body = {**p4, "sign_method": "sha256", "sign": sign}
-
-        for mode in ("post_form", "get"):
-            result = try_request(label, body, mode)
-            if result is not None:
-                return result
-
-    # ================================================================
-    # WARIANT 14-20: Sync endpoint z method=aliexpress.system.oauth.token
-    # Standard TOP API wymaga method, format, v w sygnaturze.
-    # ================================================================
-    debug("=" * 56)
-    debug("WARIANTY 14-20: SYNC endpoint (aliexpress.system.oauth.token)")
-    debug("=" * 56)
-
-    sync_url = SYNC_URL  # https://api-sg.aliexpress.com/sync
-    p_sync = {
-        "method": "aliexpress.system.oauth.token",
-        "app_key": app_key,
-        "timestamp": timestamp,
-        "format": "json",
-        "v": "2.0",
-        "sign_method": "sha256",
-        "code": code,
-        "grant_type": "authorization_code",
-    }
-    p_sync_md5 = {**p_sync}
-
-    def _hmac_sign(params: dict) -> str:
-        base = "".join(f"{k}{v}" for k, v in sorted(params.items()))
-        debug(f"  HMAC base[0:100]={base[:100]}")
-        return hmac.new(
-            key=app_secret.encode(), msg=base.encode(),
-            digestmod=hashlib.sha256,
-        ).hexdigest().upper()
-
-    def _hmac_sign_lower(params: dict) -> str:
-        base = "".join(f"{k}{v}" for k, v in sorted(params.items()))
-        return hmac.new(
-            key=app_secret.encode(), msg=base.encode(),
-            digestmod=hashlib.sha256,
-        ).hexdigest()
-
-    def _md5_sign(params: dict, prefix: str = "", suffix: str = "") -> str:
-        base = prefix + "".join(f"{k}{v}" for k, v in sorted(params.items())) + suffix
-        debug(f"  MD5 base[0:100]={base[:100]}")
-        return hashlib.md5(base.encode()).hexdigest().upper()
-
-    def try_sync(label: str, extra_params: dict, sign_fn) -> dict | None:
-        p = {**p_sync, **extra_params}
-        s = sign_fn(p)
-        body = {**p, "sign": s}
-        debug(f"--- Proba [{label}] sync_url ---")
-        try:
-            resp = _do_request(sync_url, body, "post_form")
-        except requests.RequestException as e:
-            debug(f"  => HTTP error: {e}")
-            return None
-        nonlocal last_response
-        debug(f"  RESPONSE: HTTP {resp.status_code}")
-        debug(f"  Body:     {resp.text[:400]}")
-        try:
-            data = resp.json()
-        except ValueError:
-            data = {"raw": resp.text}
-        last_response = data
-        # REST: plaska struktura z access_token
-        # SYNC: zagniezdzone w aliexpress_system_oauth_token_response
-        nested = data.get("aliexpress_system_oauth_token_response", {})
-        if resp.status_code == 200 and (
-            data.get("access_token") or nested.get("access_token")
-        ):
-            if nested.get("access_token"):
-                data = nested  # normalizuj do plaskiej struktury
-            info(f"TRAFIONY WARIANT: [{label}]")
-            return data
-        return None
-
-    # 14: SYNC HMAC-SHA256 standard
-    r = try_sync("14: SYNC HMAC sha256", {}, _hmac_sign)
-    if r: return r
-
-    # 15: SYNC MD5 S+p+S (classic TOP format)
-    r = try_sync("15: SYNC MD5 S+p+S", {},
-                 lambda p: _md5_sign(p, prefix=app_secret, suffix=app_secret))
-    if r: return r
-
-    # 16: SYNC HMAC lowercase hex
-    r = try_sync("16: SYNC HMAC lower", {}, _hmac_sign_lower)
-    if r: return r
-
-    # 17: SYNC bez format i v (minimalny zestaw)
-    p_sync_minimal = {
-        "method": "aliexpress.system.oauth.token",
-        "app_key": app_key,
-        "timestamp": timestamp,
-        "sign_method": "sha256",
-        "code": code,
-        "grant_type": "authorization_code",
-    }
-    s17 = _hmac_sign(p_sync_minimal)
-    body17 = {**p_sync_minimal, "sign": s17}
-    r = try_request("17: SYNC-minimal HMAC", body17, "post_form")
-    if r: return r
-
-    # ================================================================
-    # WARIANT 18-22: REST endpoint z nowymi kombinacjami
-    # ================================================================
-    debug("=" * 56)
-    debug("WARIANTY 18-22: REST z nowymi kombinacjami")
-    debug("=" * 56)
-
-    # 18: REST + redirect_uri w body I podpisie
-    if redirect_uri:
-        p18 = {**p5, "redirect_uri": redirect_uri}
-        s18 = _hmac_sign(p18)
-        body18 = {**p18, "sign": s18}
-        r = try_request("18: REST+redirect_uri HMAC", body18, "post_form")
-        if r: return r
-
-    # 19: REST + format=json + v=2.0 w podpisie
-    p19 = {**p5, "format": "json", "v": "2.0"}
-    s19 = _hmac_sign(p19)
-    body19 = {**p19, "sign": s19}
-    r = try_request("19: REST+format+v HMAC", body19, "post_form")
-    if r: return r
-
-    # 20: REST lowercase hex
-    s20 = _hmac_sign_lower(p5)
-    body20 = {**p4, "sign_method": "sha256", "sign": s20}
-    r = try_request("20: REST HMAC lowercase", body20, "post_form")
-    if r: return r
-
-    # 21: REST timestamp w sekundach (nie milisekundach)
-    ts_sec = str(int(time.time()))
-    p21 = {"app_key": app_key, "code": code, "grant_type": "authorization_code",
-           "timestamp": ts_sec, "sign_method": "sha256"}
-    s21 = _hmac_sign(p21)
-    body21 = {**p21, "sign": s21}
-    r = try_request("21: REST timestamp-sec HMAC", body21, "post_form")
-    if r: return r
-
-    # 22: REST base string z = i & separatorami (URL-query format)
-    def _hmac_url_fmt(params: dict) -> str:
-        qs = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-        debug(f"  HMAC url-fmt base[0:100]={qs[:100]}")
-        return hmac.new(
-            key=app_secret.encode(), msg=qs.encode(),
-            digestmod=hashlib.sha256,
-        ).hexdigest().upper()
-
-    s22 = _hmac_url_fmt(p5)
-    body22 = {**p4, "sign_method": "sha256", "sign": s22}
-    r = try_request("22: REST base-with-equals HMAC", body22, "post_form")
-    if r: return r
-
-    # 23: REST auth params w URL query, business w body
-    p23_url = {"app_key": app_key, "timestamp": timestamp,
-               "sign_method": "sha256"}
-    p23_biz = {"code": code, "grant_type": "authorization_code"}
-    p23_all = {**p23_url, **p23_biz}
-    s23 = _hmac_sign(p23_all)
-    p23_url["sign"] = s23
-    from urllib.parse import urlencode as _ue23
-    rest_url_with_qs = rest_url + "?" + _ue23(p23_url)
-    debug(f"--- Proba [23: REST split URL/body] ---")
-    debug(f"  URL: {rest_url_with_qs}")
-    debug(f"  Body: {p23_biz}")
-    try:
-        resp23 = requests.post(rest_url_with_qs, data=p23_biz,
-                               headers={"Content-Type": "application/x-www-form-urlencoded"},
-                               timeout=15)
-        debug(f"  RESPONSE: HTTP {resp23.status_code}  {resp23.text[:400]}")
-        try:
-            d23 = resp23.json()
-        except ValueError:
-            d23 = {"raw": resp23.text}
-        last_response = d23
-        if resp23.status_code == 200 and d23.get("access_token"):
-            info("TRAFIONY WARIANT: [23: REST split URL/body]")
-            return d23
-    except requests.RequestException as e:
-        debug(f"  => HTTP error: {e}")
-
-    info("Zaden z wariantow nie zwrocil sukcesu.")
-    info("Pelna ostatnia odpowiedz powyzej w [DBG].")
-    return last_response
+    return response
 
 
 # ---------------------------------------------------------------------------
-# Krok 4 — Parsowanie odpowiedzi
-# ---------------------------------------------------------------------------
-
-def extract_token(data: dict) -> tuple[str, str, int]:
-    """
-    Wyciaga (access_token, refresh_token, expire_time) z odpowiedzi.
-
-    REST /rest/auth/token/create zwraca plaska strukture:
-      { "access_token": "...", "refresh_token": "...", "expire_time": ... }
-    Obslugujemy tez zagniezdzone formaty na wypadek wariantow API.
-    """
-    # Format REST — plaska struktura
-    access_token = data.get("access_token", "")
-    refresh_token = data.get("refresh_token", "")
-    expire_time = int(data.get("expire_time", 0) or data.get("expires_in", 0) or 0)
-
-    if access_token:
-        return access_token, refresh_token, expire_time
-
-    # Format SYNC — aliexpress_system_oauth_token_response
-    nested = data.get("aliexpress_system_oauth_token_response", {})
-    if nested.get("access_token"):
-        return (
-            nested.get("access_token", ""),
-            nested.get("refresh_token", ""),
-            int(nested.get("expire_time", 0) or 0),
-        )
-
-    # Zagniezdzone w "result" (wariant)
-    if isinstance(data.get("result"), dict):
-        result = data["result"]
-        access_token = result.get("access_token", "")
-        refresh_token = result.get("refresh_token", "")
-        expire_time = int(result.get("expire_time", 0) or 0)
-
-    return access_token, refresh_token, expire_time
-
-
-# ---------------------------------------------------------------------------
-# Krok 5 — Zapis tokena do .env
+# Krok 4 — Zapis tokena do .env
 # ---------------------------------------------------------------------------
 
 def save_to_env(key: str, value: str) -> None:
@@ -606,7 +215,6 @@ def main() -> int:
         fail("Nie podano code.")
         return 1
 
-    # Wyciagnij code z URL jesli uzytkownik wkleił cały URL
     code = code_input
     if "code=" in code_input:
         match = re.search(r"[?&]code=([^&]+)", code_input)
@@ -620,43 +228,33 @@ def main() -> int:
     ok(f"Code: {code[:12]}... (dlugosc: {len(code)})")
 
     # ---------- KROK 4: wymiana na token ----------
-    step(4, "Wymiana authorization code na Access Token")
+    step(4, "Wymiana authorization code na Access Token (IOP SDK)")
     try:
-        response_data = exchange_code(code, app_key, app_secret)
+        response = exchange_code(code, app_key, app_secret)
     except requests.RequestException as e:
         fail(f"Blad HTTP: {e}")
         return 1
 
-    print(f"\n  Pelna odpowiedz API:\n  {json.dumps(response_data, indent=4, ensure_ascii=False)}")
-
-    access_token, refresh_token, expire_time = extract_token(response_data)
-
-    if not access_token:
+    if not response.is_success():
         print()
         fail("Nie otrzymano access_token w odpowiedzi.")
-        error_msg = (
-            response_data.get("error_description")
-            or response_data.get("error_message")
-            or response_data.get("msg")
-            or response_data.get("sub_msg")
-            or "brak opisu bledu"
-        )
-        fail(f"Blad: {error_msg}")
+        fail(f"Kod bledu:  {response.code}")
+        fail(f"Komunikat: {response.message}")
         return 1
 
     print()
-    ok(f"Access Token:  {access_token[:20]}...")
-    if refresh_token:
-        ok(f"Refresh Token: {refresh_token[:20]}...")
-    if expire_time:
-        hours = expire_time // 3600
-        ok(f"Waznosc:       {hours}h ({expire_time}s)")
+    ok(f"Access Token:  {response.access_token[:20]}...")
+    if response.refresh_token:
+        ok(f"Refresh Token: {response.refresh_token[:20]}...")
+    if response.expire_time:
+        hours = response.expire_time // 3600
+        ok(f"Waznosc:       {hours}h ({response.expire_time}s)")
 
     # ---------- KROK 5: zapis do .env ----------
     step(5, "Zapis tokenow do .env")
-    save_to_env("ALIEXPRESS_ACCESS_TOKEN", access_token)
-    if refresh_token:
-        save_to_env("ALIEXPRESS_REFRESH_TOKEN", refresh_token)
+    save_to_env("ALIEXPRESS_ACCESS_TOKEN", response.access_token)
+    if response.refresh_token:
+        save_to_env("ALIEXPRESS_REFRESH_TOKEN", response.refresh_token)
 
     print()
     print("╔══════════════════════════════════════════════════════════╗")
