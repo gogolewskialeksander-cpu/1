@@ -202,30 +202,50 @@ def exchange_code(code: str, app_key: str, app_secret: str) -> dict:
         except ValueError:
             data = {"raw": resp.text}
         last_response = data
-        if not _is_incomplete_sig(data) and resp.status_code == 200:
+        # Sukces tylko jesli odpowiedz zawiera access_token
+        if resp.status_code == 200 and data.get("access_token"):
             info(f"TRAFIONY WARIANT: [{label}] [{mode}]")
             return data
         return None
 
     # ================================================================
-    # WARIANT 0: Standardowy OAuth 2.0 — BEZ custom podpisu AliExpress
-    # Endpoint REST moze akceptowac client_id/client_secret zamiast sign
+    # WARIANT 0a: app_key (nie client_id) + app_secret, bez podpisu
+    # Odpowiedz powiedzila ze brakuje app_key — uzywamy app_key
     # ================================================================
     debug("=" * 56)
-    debug("WARIANT 0: Standardowy OAuth 2.0 (brak custom sign)")
+    debug("WARIANTY BEZ CUSTOM SIGN (rozne kombinacje app_key)")
     debug("=" * 56)
-    for mode in ("post_form", "get"):
-        oauth2_body = {
-            "code": code,
-            "grant_type": "authorization_code",
-            "client_id": app_key,
-            "client_secret": app_secret,
-        }
-        if redirect_uri:
-            oauth2_body["redirect_uri"] = redirect_uri
-        result = try_request("OAuth2 standard", oauth2_body, mode)
-        if result is not None:
-            return result
+
+    no_sign_variants = [
+        # etykieta, body
+        ("0a: app_key + app_secret", {
+            "app_key": app_key, "app_secret": app_secret,
+            "code": code, "grant_type": "authorization_code",
+        }),
+        ("0b: app_key + app_secret + redirect_uri", {
+            "app_key": app_key, "app_secret": app_secret,
+            "code": code, "grant_type": "authorization_code",
+            "redirect_uri": redirect_uri,
+        }),
+        ("0c: app_key tylko (bez secret)", {
+            "app_key": app_key,
+            "code": code, "grant_type": "authorization_code",
+        }),
+        ("0d: app_key + client_secret", {
+            "app_key": app_key, "client_secret": app_secret,
+            "code": code, "grant_type": "authorization_code",
+        }),
+        ("0e: app_key + timestamp (bez sign)", {
+            "app_key": app_key, "timestamp": timestamp,
+            "code": code, "grant_type": "authorization_code",
+        }),
+    ]
+
+    for label, body in no_sign_variants:
+        for mode in ("post_form", "get"):
+            result = try_request(label, body, mode)
+            if result is not None:
+                return result
 
     # ================================================================
     # WARIANT 1-9: Custom podpis AliExpress (HMAC/MD5, rozne zestawy)
