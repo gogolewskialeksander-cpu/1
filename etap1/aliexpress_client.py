@@ -16,7 +16,6 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -32,18 +31,38 @@ PARTNER_ID: str = "iop-sdk-python-20220609"
 DAILY_REQUEST_LIMIT: int = 1000
 REQUEST_TIMEOUT_SECONDS: int = 30
 
-SCRAPE_URL: str = "https://www.aliexpress.com/wholesale"
-SCRAPE_HEADERS: Dict[str, str] = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Referer": "https://www.aliexpress.com/",
-}
+# Produkty z EU/Local+ (shipto=PL, local_sale=y) zebrane recznym przegladem
+# https://www.aliexpress.com/wholesale?SearchText=&shipto=PL&local_sale=y
+# Uzupelnij liste o kolejne ID jesli potrzebujesz wiecej produktow.
+SEED_PRODUCT_IDS: List[str] = [
+    # USB cables / akcesoria (Local+ PL)
+    "1005012048194921",
+    "1005012026282181",
+    "1005012040639956",
+    "1005007075301656",
+    "1005012041551310",
+    "1005012022927089",
+    "1005011997720160",
+    "1005011601060929",
+    "1005006704880455",
+    "1005007210342632",
+    "1005011997460850",
+    "1005009500620513",
+    # LED strip (Local+ PL)
+    "3256807728241849",
+    "3256811467887701",
+    "3256811730162691",
+    "2251801850504415",
+    "3256811730230942",
+    "3256811495014471",
+    # Smartwatch (Local+ PL)
+    "1005008830601930",
+    "1005010652282931",
+    "1005007878817406",
+    "1005010397546951",
+    "1005007862253543",
+    "1005010439298612",
+]
 
 
 @dataclass
@@ -253,56 +272,6 @@ class AliExpressClient:
             },
         )
 
-    def _scrape_product_ids(self, limit: int) -> List[str]:
-        """
-        Scrapuje product_id ze strony AliExpress Local+ dla Polski.
-
-        URL: https://www.aliexpress.com/wholesale?SearchText=&shipto=PL&local_sale=y
-        Wyciaga ID z URL-ow produktow (/item/XXXXXXXXXX.html) oraz
-        z osadzonych danych JSON w HTML strony.
-        Paginacja po parametrze &page=N.
-        """
-        seen: set = set()
-        product_ids: List[str] = []
-
-        for page in range(1, 15):
-            if len(product_ids) >= limit:
-                break
-            try:
-                resp = self._session.get(
-                    SCRAPE_URL,
-                    params={"SearchText": "", "shipto": "PL", "local_sale": "y", "page": page},
-                    headers=SCRAPE_HEADERS,
-                    timeout=REQUEST_TIMEOUT_SECONDS,
-                )
-                resp.raise_for_status()
-                html = resp.text
-            except requests.RequestException as e:
-                self.logger.warn(f"Scraping blad strona {page}: {e}")
-                break
-
-            # Wyciagnij ID z roznych wzorcow w HTML
-            found: List[str] = (
-                re.findall(r'/item/(\d{10,}?)\.html', html)
-                + re.findall(r'"productId"\s*:\s*"?(\d{10,})"?', html)
-                + re.findall(r'data-product-id="(\d{10,})"', html)
-                + re.findall(r'"id"\s*:\s*"?(\d{10,})"?', html)
-            )
-
-            new_count = 0
-            for pid in found:
-                if pid not in seen:
-                    seen.add(pid)
-                    product_ids.append(pid)
-                    new_count += 1
-
-            self.logger.ok(f"Scraping strona {page}: +{new_count} ID ({len(product_ids)} lacznie)")
-
-            if new_count == 0:
-                break  # Brak nowych produktow — koniec paginacji
-
-        return product_ids[:limit]
-
     def search_products(
         self,
         ship_from_countries: List[str],
@@ -310,31 +279,22 @@ class AliExpressClient:
         keyword: str = "",
     ) -> List[str]:
         """
-        Zwraca liste product_id przez scraping AliExpress Local+ dla Polski.
+        Zwraca liste product_id ze statycznej listy SEED_PRODUCT_IDS.
 
-        Scrapuje https://www.aliexpress.com/wholesale?shipto=PL&local_sale=y
-        i wyciaga product_id z URL-ow produktow. Filtrowanie po magazynie EU
-        (ship_from_countries) odbywa sie w fetch_products() po pobraniu
-        szczegolnych danych przez aliexpress.ds.product.get.
+        Produkty zebrane recznym przegladem AliExpress Local+ (shipto=PL,
+        local_sale=y). Filtrowanie po ship_from_country (EU) odbywa sie
+        pozniej w fetch_products() na podstawie odpowiedzi ds.product.get.
 
         Args:
             ship_from_countries: Lista kodow krajow EU — uzywana w fetch_products().
-            limit: Maksymalna liczba produktow do pobrania.
+            limit: Maksymalna liczba produktow do sprawdzenia.
 
         Returns:
-            Lista identyfikatorow produktow.
+            Lista identyfikatorow produktow do sprawdzenia przez DS API.
         """
-        # Pobieramy wiecej niz limit bo czesc zostanie odfiltrowana po EU check
-        target = min(limit * 3, DAILY_REQUEST_LIMIT // 3)
-        self.logger.ok(f"Scraping AliExpress Local+ PL (cel: {target} ID)...")
-        product_ids = self._scrape_product_ids(target)
-
-        if not product_ids:
-            self.logger.fail("Scraping nie zwrocil zadnych product_id")
-            return []
-
-        self.logger.ok(f"Scraping: znaleziono {len(product_ids)} unikalnych product_id")
-        return product_ids
+        ids = SEED_PRODUCT_IDS[:limit]
+        self.logger.ok(f"SEED: {len(ids)} product_id do sprawdzenia przez DS API")
+        return ids
 
     def fetch_products(
         self,
