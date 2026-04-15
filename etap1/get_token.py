@@ -144,19 +144,20 @@ def generate_oauth_url(app_key: str, redirect_uri: str) -> str:
 
 def exchange_code(code: str, app_key: str, app_secret: str) -> dict:
     """
-    Wymiana authorization code na Access Token przez standardowy sync endpoint.
+    Wymiana authorization code na Access Token przez REST endpoint.
 
-    Uzywa metody aliexpress.system.oauth.token (identyczny format podpisu
-    jak wszystkie inne wywolania API — TOP sync endpoint, nie REST).
+    Endpoint: POST https://api-sg.aliexpress.com/rest/auth/token/create
 
-    Endpoint: POST https://api-sg.aliexpress.com/sync
-    Method:   aliexpress.system.oauth.token
+    Podpis HMAC-SHA256 dla REST: sciezka endpointu jest doklejana
+    przed posortowanymi parami klucz+wartosc w base stringu.
+
+    Body: code, grant_type, app_key, timestamp, sign_method, sign
     """
-    sync_url = "https://api-sg.aliexpress.com/sync"
+    rest_url = "https://api-sg.aliexpress.com/rest/auth/token/create"
+    api_path = "/rest/auth/token/create"
     timestamp = str(int(time.time() * 1000))
 
     params: dict[str, str] = {
-        "method": "aliexpress.system.oauth.token",
         "app_key": app_key,
         "timestamp": timestamp,
         "sign_method": "sha256",
@@ -164,15 +165,23 @@ def exchange_code(code: str, app_key: str, app_secret: str) -> dict:
         "grant_type": "authorization_code",
     }
 
-    # Podpisz wszystkie parametry (przed dodaniem sign do dict)
-    params["sign"] = build_signature(params, app_secret)
+    # Podpis REST: sciezka + posortowane pary klucz+wartosc
+    sorted_items = sorted(params.items())
+    base_string = api_path + "".join(f"{k}{v}" for k, v in sorted_items)
+    debug(f"Base string (pierwsze 120 zn.): {base_string[:120]}")
+    sign = hmac.new(
+        key=app_secret.encode("utf-8"),
+        msg=base_string.encode("utf-8"),
+        digestmod=hashlib.sha256,
+    ).hexdigest().upper()
+    debug(f"HMAC-SHA256: {sign}")
+    params["sign"] = sign
 
-    info(f"Endpoint: POST {sync_url}")
-    info(f"Method:   aliexpress.system.oauth.token")
+    info(f"Endpoint: POST {rest_url}")
     info(f"app_key={app_key}  timestamp={timestamp}  code={code[:12]}...")
 
     resp = requests.post(
-        sync_url,
+        rest_url,
         data=params,
         timeout=30,
     )
@@ -194,26 +203,20 @@ def extract_token(data: dict) -> tuple[str, str, int]:
     """
     Wyciaga (access_token, refresh_token, expire_time) z odpowiedzi.
 
-    aliexpress.system.oauth.token zwraca dane pod kluczem:
-      aliexpress_system_oauth_token_response -> result
-    Obslugujemy tez starsze/alternatywne formaty.
+    REST /rest/auth/token/create zwraca plaska strukture:
+      { "access_token": "...", "refresh_token": "...", "expire_time": ... }
+    Obslugujemy tez zagniezdzone formaty na wypadek wariantow API.
     """
-    # Format TOP sync: aliexpress_system_oauth_token_response -> result
-    top_resp = data.get("aliexpress_system_oauth_token_response", {})
-    if top_resp:
-        result = top_resp.get("result", top_resp)
-        access_token = result.get("access_token", "")
-        refresh_token = result.get("refresh_token", "")
-        expire_time = int(result.get("expire_time", 0) or 0)
-        return access_token, refresh_token, expire_time
-
-    # Format plaska struktura (REST endpoint)
+    # Format REST — plaska struktura
     access_token = data.get("access_token", "")
     refresh_token = data.get("refresh_token", "")
     expire_time = int(data.get("expire_time", 0) or data.get("expires_in", 0) or 0)
 
-    # Format zagniezdzone w "result"
-    if not access_token and isinstance(data.get("result"), dict):
+    if access_token:
+        return access_token, refresh_token, expire_time
+
+    # Zagniezdzone w "result" (wariant)
+    if isinstance(data.get("result"), dict):
         result = data["result"]
         access_token = result.get("access_token", "")
         refresh_token = result.get("refresh_token", "")
