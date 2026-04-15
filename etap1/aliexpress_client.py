@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -30,6 +31,19 @@ SIGN_METHOD: str = "sha256"
 PARTNER_ID: str = "iop-sdk-python-20220609"
 DAILY_REQUEST_LIMIT: int = 1000
 REQUEST_TIMEOUT_SECONDS: int = 30
+
+SCRAPE_URL: str = "https://www.aliexpress.com/wholesale"
+SCRAPE_HEADERS: Dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": "https://www.aliexpress.com/",
+}
 
 
 @dataclass
@@ -239,6 +253,56 @@ class AliExpressClient:
             },
         )
 
+    def _scrape_product_ids(self, limit: int) -> List[str]:
+        """
+        Scrapuje product_id ze strony AliExpress Local+ dla Polski.
+
+        URL: https://www.aliexpress.com/wholesale?SearchText=&shipto=PL&local_sale=y
+        Wyciaga ID z URL-ow produktow (/item/XXXXXXXXXX.html) oraz
+        z osadzonych danych JSON w HTML strony.
+        Paginacja po parametrze &page=N.
+        """
+        seen: set = set()
+        product_ids: List[str] = []
+
+        for page in range(1, 15):
+            if len(product_ids) >= limit:
+                break
+            try:
+                resp = self._session.get(
+                    SCRAPE_URL,
+                    params={"SearchText": "", "shipto": "PL", "local_sale": "y", "page": page},
+                    headers=SCRAPE_HEADERS,
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+                resp.raise_for_status()
+                html = resp.text
+            except requests.RequestException as e:
+                self.logger.warn(f"Scraping blad strona {page}: {e}")
+                break
+
+            # Wyciagnij ID z roznych wzorcow w HTML
+            found: List[str] = (
+                re.findall(r'/item/(\d{10,}?)\.html', html)
+                + re.findall(r'"productId"\s*:\s*"?(\d{10,})"?', html)
+                + re.findall(r'data-product-id="(\d{10,})"', html)
+                + re.findall(r'"id"\s*:\s*"?(\d{10,})"?', html)
+            )
+
+            new_count = 0
+            for pid in found:
+                if pid not in seen:
+                    seen.add(pid)
+                    product_ids.append(pid)
+                    new_count += 1
+
+            self.logger.ok(f"Scraping strona {page}: +{new_count} ID ({len(product_ids)} lacznie)")
+
+            if new_count == 0:
+                break  # Brak nowych produktow — koniec paginacji
+
+        return product_ids[:limit]
+
     def search_products(
         self,
         ship_from_countries: List[str],
@@ -246,78 +310,31 @@ class AliExpressClient:
         keyword: str = "",
     ) -> List[str]:
         """
-        Zwraca liste product_id przez aliexpress.ds.recommend.feed.get.
+        Zwraca liste product_id przez scraping AliExpress Local+ dla Polski.
 
-        Probuje kolejno feed_name: DS_bestseller_en, DS_NEW_ARRIVAL,
-        DS_HOT_SELLER, DS_default — az jeden zwroci produkty.
-        Filtruje wyniki po ship_from_country (magazyn EU).
+        Scrapuje https://www.aliexpress.com/wholesale?shipto=PL&local_sale=y
+        i wyciaga product_id z URL-ow produktow. Filtrowanie po magazynie EU
+        (ship_from_countries) odbywa sie w fetch_products() po pobraniu
+        szczegolnych danych przez aliexpress.ds.product.get.
 
         Args:
-            ship_from_countries: Lista kodow krajow EU (np. ['PL', 'DE']).
+            ship_from_countries: Lista kodow krajow EU — uzywana w fetch_products().
             limit: Maksymalna liczba produktow do pobrania.
 
         Returns:
             Lista identyfikatorow produktow.
         """
-        eu_set = {c.upper() for c in ship_from_countries}
-        feed_names = ["DS_bestseller_en", "DS_NEW_ARRIVAL", "DS_HOT_SELLER", "DS_default"]
+        # Pobieramy wiecej niz limit bo czesc zostanie odfiltrowana po EU check
+        target = min(limit * 3, DAILY_REQUEST_LIMIT // 3)
+        self.logger.ok(f"Scraping AliExpress Local+ PL (cel: {target} ID)...")
+        product_ids = self._scrape_product_ids(target)
 
-        for feed_name in feed_names:
-            product_ids: List[str] = []
-            page_no = 1
-            page_size = min(20, limit)
+        if not product_ids:
+            self.logger.fail("Scraping nie zwrocil zadnych product_id")
+            return []
 
-            self.logger.ok(f"AliExpress feed: {feed_name}")
-
-            while len(product_ids) < limit:
-                try:
-                    response = self._call(
-                        "aliexpress.ds.recommend.feed.get",
-                        {
-                            "feed_name": feed_name,
-                            "country": "PL",
-                            "currency": "PLN",
-                            "language": "EN",
-                            "page_no": page_no,
-                            "page_size": page_size,
-                        },
-                    )
-                except AliExpressAPIError as e:
-                    self.logger.warn(f"Feed {feed_name} blad: {e}")
-                    break
-
-                # aliexpress_ds_recommend_feed_get_response -> result -> products
-                root = response.get("aliexpress_ds_recommend_feed_get_response", {})
-                result = root.get("result", {})
-                products = result.get("products", {}).get("traffic_product_d_t_o", [])
-
-                if not products:
-                    self.logger.warn(
-                        f"Feed {feed_name} strona {page_no}: brak produktow. "
-                        f"Odpowiedz: {str(root)[:200]}"
-                    )
-                    break
-
-                for p in products:
-                    pid = str(p.get("product_id", ""))
-                    if not pid:
-                        continue
-                    ship_from = str(p.get("ship_from_country", "")).upper()
-                    if ship_from and eu_set and ship_from not in eu_set:
-                        continue
-                    product_ids.append(pid)
-                    if len(product_ids) >= limit:
-                        break
-
-                if len(product_ids) >= limit or len(products) < page_size:
-                    break
-                page_no += 1
-
-            if product_ids:
-                self.logger.ok(f"Feed {feed_name}: znaleziono {len(product_ids)} produktow")
-                return product_ids[:limit]
-
-        return []
+        self.logger.ok(f"Scraping: znaleziono {len(product_ids)} unikalnych product_id")
+        return product_ids
 
     def fetch_products(
         self,
@@ -345,16 +362,28 @@ class AliExpressClient:
         self.logger.ok(f"AliExpress: znaleziono {len(product_ids)} produktow")
         products: List[Product] = []
 
+        eu_set = {c.upper() for c in ship_from_countries} if ship_from_countries else set()
+
         for idx, pid in enumerate(product_ids, start=1):
+            if len(products) >= limit:
+                break
             try:
                 raw_product = self.get_product(pid)
                 raw_shipping = self.query_shipping(pid)
                 product = self._parse_product(raw_product, raw_shipping)
-                if product is not None:
-                    products.append(product)
-                    self.logger.ok(
-                        f"  [{idx}/{len(product_ids)}] {product.title[:60]}"
+                if product is None:
+                    continue
+                # Filtruj po magazynie EU
+                if eu_set and product.ship_from_country not in eu_set:
+                    self.logger.warn(
+                        f"  [{idx}] {pid}: pominiety — magazyn {product.ship_from_country} (nie EU)"
                     )
+                    continue
+                products.append(product)
+                self.logger.ok(
+                    f"  [{idx}/{len(product_ids)}] {product.title[:60]} "
+                    f"[{product.ship_from_country}]"
+                )
             except AliExpressAPIError as e:
                 self.logger.warn(f"  [{idx}/{len(product_ids)}] {pid}: {e}")
                 continue
