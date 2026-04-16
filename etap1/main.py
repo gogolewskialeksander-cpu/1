@@ -149,9 +149,9 @@ def parse_args() -> argparse.Namespace:
         help="Maksymalna liczba produktow (nadpisuje MAX_PRODUCTS_PER_RUN)",
     )
     parser.add_argument(
-        "--no-baselinker",
+        "--baselinker",
         action="store_true",
-        help="Pomiń wysyłkę do BaseLinker (tylko XML)",
+        help="Włącz wysyłkę do BaseLinker (domyślnie wyłączona)",
     )
     parser.add_argument(
         "--country",
@@ -247,8 +247,8 @@ def run_pipeline(config: Config, args: argparse.Namespace, logger: Logger) -> in
         return 2
 
     # ===== KROK 6: WYSYLKA DO BASELINKER =====
-    if config.test_mode or args.no_baselinker:
-        logger.ok("Pominieto wysylke do BaseLinker (--no-baselinker lub tryb testowy)")
+    if config.test_mode or not args.baselinker:
+        logger.ok("Pominieto wysylke do BaseLinker (dodaj --baselinker zeby wyslac)")
     else:
         bl_client = BaseLinkerClient(
             token=config.baselinker_api_token,
