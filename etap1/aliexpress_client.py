@@ -335,14 +335,35 @@ class AliExpressClient:
                 if isinstance(sku_list, dict):
                     sku_list = sku_list.get("ae_item_sku_info_d_t_o", [])
                 sku_ship_from = ""
-                for sku in (sku_list[:1] if sku_list else []):
-                    props = sku.get("ae_sku_property_dtos", [])
-                    if isinstance(props, dict):
-                        props = props.get("ae_sku_property_d_t_o", [])
-                    for prop in props:
-                        if prop.get("sku_property_name", "") == "Ships From":
+                for sku in (sku_list or []):
+                    raw_p = sku.get("ae_sku_property_dtos", [])
+                    if isinstance(raw_p, dict):
+                        p_list = (
+                            raw_p.get("ae_sku_property_d_t_o")
+                            or (list(raw_p.values())[0] if raw_p else [])
+                        )
+                        if not isinstance(p_list, list):
+                            p_list = [p_list]
+                    elif isinstance(raw_p, list):
+                        p_list = raw_p
+                    else:
+                        p_list = []
+                    for prop in p_list:
+                        if not isinstance(prop, dict):
+                            continue
+                        if (prop.get("sku_property_id") == 200007763
+                                or prop.get("sku_property_name", "") == "Ships From"):
                             sku_ship_from = prop.get("sku_property_value", "")
                             break
+                    if sku_ship_from:
+                        break
+                # Loguj surowy typ ae_sku_property_dtos dla diagnozy
+                if sku_list:
+                    raw_p_sample = sku_list[0].get("ae_sku_property_dtos", "BRAK")
+                    self.logger.ok(
+                        f"    [DEBUG] ae_sku_property_dtos type={type(raw_p_sample).__name__} "
+                        f"sample={str(raw_p_sample)[:200]}"
+                    )
                 ship_display = sku_ship_from or raw_ship_from
                 self.logger.ok(
                     f"  [{idx}/{len(product_ids)}] {pid} | "
@@ -469,11 +490,28 @@ class AliExpressClient:
             stock += sku_stock
 
             # Zbierz ship_from ze WSZYSTKICH wariantow SKU
-            props = sku.get("ae_sku_property_dtos", [])
-            if isinstance(props, dict):
-                props = props.get("ae_sku_property_d_t_o", [])
-            for prop in (props or []):
-                if str(prop.get("sku_property_name", "")).strip() == "Ships From":
+            raw_props = sku.get("ae_sku_property_dtos", [])
+            if isinstance(raw_props, dict):
+                # Moze byc owiniety w ae_sku_property_d_t_o lub bezposrednio
+                props: List[Any] = (
+                    raw_props.get("ae_sku_property_d_t_o")
+                    or raw_props.get("ae_sku_property_dtos")
+                    or list(raw_props.values())[0] if raw_props else []
+                )
+                if not isinstance(props, list):
+                    props = [props]
+            elif isinstance(raw_props, list):
+                props = raw_props
+            else:
+                props = []
+
+            for prop in props:
+                if not isinstance(prop, dict):
+                    continue
+                prop_id = prop.get("sku_property_id")
+                prop_name = str(prop.get("sku_property_name", "")).strip()
+                # Szukaj po ID (200007763) lub nazwie "Ships From"
+                if prop_id == 200007763 or prop_name == "Ships From":
                     val = str(prop.get("sku_property_value", "")).strip()
                     if val and val not in all_ship_from_values:
                         all_ship_from_values.append(val)
@@ -493,8 +531,9 @@ class AliExpressClient:
         # Loguj wszystkie raw ship_from values ze SKU
         logistics_ship_from = logistics.get("ship_from_country", "")
         self.logger.ok(
-            f"    ship_from SKU values: {all_ship_from_values} "
-            f"| logistics: {logistics_ship_from!r}"
+            f"    ship_from raw values: {all_ship_from_values} "
+            f"| logistics: {logistics_ship_from!r} "
+            f"| sku_count={len(sku_info_list)}"
         )
 
         # Zamien raw wartosci na kody ISO i wybierz EU jesli dostepne
