@@ -257,6 +257,47 @@ class AliExpressClient:
             },
         )
 
+    def _ids_from_feed_itemids(self, feed_name: str, limit: int) -> List[str]:
+        """
+        Pobiera product_id przez aliexpress.ds.feed.itemids.get.
+
+        Lzejszy endpoint — zwraca tylko ID bez pelnych danych produktu.
+        Zwraca [] jesli feed pusty lub metoda niedostepna.
+        """
+        ids: List[str] = []
+        try:
+            data = self._call(
+                "aliexpress.ds.feed.itemids.get",
+                {
+                    "feed_name": feed_name,
+                    "page_size": str(min(limit, 50)),
+                    "page_no": "1",
+                },
+            )
+            root = data.get("aliexpress_ds_feed_itemids_get_response", {}) or data
+            result = root.get("result", root) if isinstance(root, dict) else {}
+
+            # product_ids moze byc lista stringow lub lista dict
+            raw = result.get("product_ids") if isinstance(result, dict) else None
+            if isinstance(raw, list):
+                for item in raw:
+                    if isinstance(item, dict):
+                        pid = str(item.get("product_id", "")).strip()
+                    else:
+                        pid = str(item).strip()
+                    if pid and pid not in ids:
+                        ids.append(pid)
+            elif isinstance(raw, str) and raw:
+                # Moze byc przecinkowa lista
+                for pid in raw.split(","):
+                    pid = pid.strip()
+                    if pid and pid not in ids:
+                        ids.append(pid)
+
+        except Exception as e:
+            self.logger.warn(f"  feed.itemids {feed_name!r} blad: {e}")
+        return ids
+
     def _ids_from_feed(self, feed_name: str, limit: int) -> List[str]:
         """
         Pobiera product_id z feeda DS aliexpress.ds.recommend.feed.get.
@@ -319,25 +360,44 @@ class AliExpressClient:
         ids: List[str] = []
         seen: set = set()
 
+        # Krok 1: feed.itemids.get (lzejszy endpoint, tylko ID)
+        self.logger.ok("Szukam produktow przez aliexpress.ds.feed.itemids.get...")
         for feed_name in DS_FEED_NAMES:
             if len(ids) >= limit:
                 break
-            self.logger.ok(f"Feed DS: {feed_name!r}...")
+            self.logger.ok(f"  feed.itemids: {feed_name!r}...")
+            feed_ids = self._ids_from_feed_itemids(feed_name, limit)
+            new = [pid for pid in feed_ids if pid not in seen]
+            ids.extend(new)
+            seen.update(new)
+            self.logger.ok(f"  => {len(feed_ids)} ID ({len(new)} nowych, lacznie {len(ids)})")
+
+        if ids:
+            result = ids[:limit]
+            self.logger.ok(f"feed.itemids: {len(result)} product_id do sprawdzenia")
+            return result
+
+        # Krok 2: recommend.feed.get (zwraca pelne dane, wyciagamy ID)
+        self.logger.warn("feed.itemids puste — proba przez recommend.feed.get...")
+        for feed_name in DS_FEED_NAMES:
+            if len(ids) >= limit:
+                break
+            self.logger.ok(f"  recommend.feed: {feed_name!r}...")
             feed_ids = self._ids_from_feed(feed_name, limit)
             new = [pid for pid in feed_ids if pid not in seen]
             ids.extend(new)
             seen.update(new)
-            self.logger.ok(f"  => {len(feed_ids)} produktow ({len(new)} nowych)")
+            self.logger.ok(f"  => {len(feed_ids)} ID ({len(new)} nowych, lacznie {len(ids)})")
 
         if ids:
             result = ids[:limit]
-            self.logger.ok(f"Feedy DS: {len(result)} product_id do sprawdzenia")
+            self.logger.ok(f"recommend.feed: {len(result)} product_id do sprawdzenia")
             return result
 
-        # Feedy puste — nowe konto bez dostepu do feedow
+        # Krok 3: SEED_PRODUCT_IDS — ostateczny fallback (znane produkty EU)
         self.logger.warn(
-            "Wszystkie feedy DS puste (nowe konto). "
-            f"Uzywam SEED_PRODUCT_IDS ({len(SEED_PRODUCT_IDS)} znanych produktow EU)."
+            f"Wszystkie feedy puste. "
+            f"Fallback na SEED_PRODUCT_IDS ({len(SEED_PRODUCT_IDS)} znanych produktow EU)."
         )
         result = SEED_PRODUCT_IDS[:limit]
         self.logger.ok(f"SEED fallback: {len(result)} product_id do sprawdzenia")
