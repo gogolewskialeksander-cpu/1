@@ -427,6 +427,20 @@ class AliExpressClient:
         elif isinstance(image_urls, list):
             images = [str(u).strip() for u in image_urls if u]
 
+        # Mapowanie pelnych nazw krajow na kody ISO (uzywane przy parsowaniu SKU)
+        COUNTRY_MAP: Dict[str, str] = {
+            "poland": "PL",
+            "germany": "DE", "deutschland": "DE",
+            "czech republic": "CZ", "czechia": "CZ",
+            "spain": "ES", "españa": "ES",
+            "france": "FR",
+            "italy": "IT", "italia": "IT",
+            "netherlands": "NL", "holland": "NL",
+            "united kingdom": "GB", "uk": "GB",
+            "united states": "US", "usa": "US",
+            "china": "CN",
+        }
+
         # Ceny i SKU
         price: float = 0.0
         price_original: float = 0.0
@@ -434,10 +448,9 @@ class AliExpressClient:
         stock: int = 0
         currency: str = "PLN"
         variants: List[Dict[str, Any]] = []
-        ship_from_sku: str = ""  # wyciagniete z ae_sku_property_dtos
+        all_ship_from_values: List[str] = []  # wszystkie raw wartosci ze wszystkich SKU
 
         for sku in sku_info_list:
-            # Cena: sku_price jest cena zakupu; offer_sale_price moze nie byc
             sku_price = float(sku.get("sku_price", 0) or 0)
             offer_price = float(sku.get("offer_sale_price", 0) or 0)
             effective_price = offer_price if offer_price > 0 else sku_price
@@ -455,15 +468,15 @@ class AliExpressClient:
                 sku_code = sku_id
             stock += sku_stock
 
-            # ship_from z wlasciwosci SKU ("Ships From")
-            if not ship_from_sku:
-                props = sku.get("ae_sku_property_dtos", [])
-                if isinstance(props, dict):
-                    props = props.get("ae_sku_property_d_t_o", [])
-                for prop in props:
-                    if str(prop.get("sku_property_name", "")).strip() == "Ships From":
-                        ship_from_sku = str(prop.get("sku_property_value", "")).strip()
-                        break
+            # Zbierz ship_from ze WSZYSTKICH wariantow SKU
+            props = sku.get("ae_sku_property_dtos", [])
+            if isinstance(props, dict):
+                props = props.get("ae_sku_property_d_t_o", [])
+            for prop in (props or []):
+                if str(prop.get("sku_property_name", "")).strip() == "Ships From":
+                    val = str(prop.get("sku_property_value", "")).strip()
+                    if val and val not in all_ship_from_values:
+                        all_ship_from_values.append(val)
 
         if sku_info_list:
             currency = sku_info_list[0].get("currency_code", "PLN")
@@ -477,22 +490,31 @@ class AliExpressClient:
         width_cm = float(package_info.get("package_width", 0) or 0)
         height_cm = float(package_info.get("package_height", 0) or 0)
 
-        # ship_from_country: SKU properties > logistics_info_dto
+        # Loguj wszystkie raw ship_from values ze SKU
         logistics_ship_from = logistics.get("ship_from_country", "")
-        ship_from_raw = ship_from_sku or logistics_ship_from or "CN"
+        self.logger.ok(
+            f"    ship_from SKU values: {all_ship_from_values} "
+            f"| logistics: {logistics_ship_from!r}"
+        )
 
-        # Mapowanie nazw krajow na kody ISO
-        COUNTRY_NAME_TO_CODE: Dict[str, str] = {
-            "poland": "PL", "polska": "PL",
-            "germany": "DE", "deutschland": "DE", "niemcy": "DE",
-            "czech republic": "CZ", "czechia": "CZ", "czechy": "CZ",
-            "spain": "ES", "espana": "ES", "espana": "ES", "hiszpania": "ES",
-            "france": "FR", "francja": "FR",
-            "united states": "US", "usa": "US",
-            "china": "CN", "chiny": "CN",
-        }
-        ship_from_upper = ship_from_raw.upper()
-        ship_from_code = COUNTRY_NAME_TO_CODE.get(ship_from_raw.lower(), ship_from_upper)
+        # Zamien raw wartosci na kody ISO i wybierz EU jesli dostepne
+        def to_code(raw: str) -> str:
+            return COUNTRY_MAP.get(raw.strip().lower(), raw.strip().upper())
+
+        sku_codes = [to_code(v) for v in all_ship_from_values]
+        logistics_code = to_code(logistics_ship_from) if logistics_ship_from else ""
+
+        # Preferuj EU wariant jesli jakikolwiek SKU ma EU magazyn
+        EU_CODES = {"PL", "DE", "CZ", "ES", "FR", "IT", "NL", "GB"}
+        eu_codes_found = [c for c in sku_codes if c in EU_CODES]
+        if eu_codes_found:
+            ship_from_code = eu_codes_found[0]
+        elif sku_codes:
+            ship_from_code = sku_codes[0]
+        elif logistics_code:
+            ship_from_code = logistics_code
+        else:
+            ship_from_code = "CN"
 
         # Czas dostawy
         estimated_days = int(logistics.get("delivery_time", 30) or 30)
