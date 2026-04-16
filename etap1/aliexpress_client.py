@@ -331,19 +331,35 @@ class AliExpressClient:
                 raw_product = self.get_product(pid)
 
                 # DEBUG: surowa odpowiedz ds.product.get
-                ds_root = raw_product.get("aliexpress_ds_product_get_response", {})
-                ds_result = ds_root.get("result", {})
+                if "aliexpress_ds_product_get_response" in raw_product:
+                    ds_result = raw_product["aliexpress_ds_product_get_response"].get("result", {})
+                else:
+                    ds_result = raw_product.get("result", {})
                 ds_logistics = ds_result.get("logistics_info_dto", {})
-                raw_ship_from = str(ds_logistics.get("ship_from_country", "BRAK")).upper()
+                raw_ship_from = str(ds_logistics.get("ship_from_country", "")).upper() or "BRAK"
                 ds_ok = bool(ds_result)
+                # Sprawdz tez ship_from w SKU properties
+                sku_list = ds_result.get("ae_item_sku_info_dtos", [])
+                if isinstance(sku_list, dict):
+                    sku_list = sku_list.get("ae_item_sku_info_d_t_o", [])
+                sku_ship_from = ""
+                for sku in (sku_list[:1] if sku_list else []):
+                    props = sku.get("ae_sku_property_dtos", [])
+                    if isinstance(props, dict):
+                        props = props.get("ae_sku_property_d_t_o", [])
+                    for prop in props:
+                        if prop.get("sku_property_name", "") == "Ships From":
+                            sku_ship_from = prop.get("sku_property_value", "")
+                            break
+                ship_display = sku_ship_from or raw_ship_from
                 self.logger.ok(
                     f"  [{idx}/{len(product_ids)}] {pid} | "
-                    f"DS API: {'OK' if ds_ok else 'BRAK WYNIKU'} | "
-                    f"ship_from_country={raw_ship_from} | "
-                    f"EU={raw_ship_from in eu_set if eu_set else 'brak_filtru'}"
+                    f"DS: {'OK' if ds_ok else 'BRAK'} | "
+                    f"ship_from={ship_display!r} | "
+                    f"EU={ship_display.upper() in eu_set if eu_set else 'brak_filtru'}"
                 )
                 if not ds_ok:
-                    self.logger.warn(f"    => ds.product.get zwrocil pusta odpowiedz: {str(ds_root)[:200]}")
+                    self.logger.warn(f"    => pusta odpowiedz: {str(raw_product)[:300]}")
 
                 raw_shipping = self.query_shipping(pid)
                 product = self._parse_product(raw_product, raw_shipping)
@@ -381,27 +397,37 @@ class AliExpressClient:
 
         Zwraca None jesli brakuje krytycznych pol (id, tytul, cena).
         """
-        root = raw_product.get("aliexpress_ds_product_get_response", {}).get("result", {})
+        # Odpowiedz moze miec klucz opakowujacy lub "result" bezposrednio na gorze
+        if "aliexpress_ds_product_get_response" in raw_product:
+            root = raw_product["aliexpress_ds_product_get_response"].get("result", {})
+        else:
+            root = raw_product.get("result", {})
         if not root:
             return None
 
         base_info = root.get("ae_item_base_info_dto", {})
-        properties = root.get("ae_item_properties", {})
         multimedia = root.get("ae_multimedia_info_dto", {})
-        sku_info_list = (
-            root.get("ae_item_sku_info_dtos", {}).get("ae_item_sku_info_d_t_o", [])
-        )
         store_info = root.get("ae_store_info", {})
         logistics = root.get("logistics_info_dto", {})
+        package_info = root.get("package_info_dto", {})
+
+        # ae_item_sku_info_dtos: moze byc lista lub dict z lista wewnatrz
+        raw_skus = root.get("ae_item_sku_info_dtos", [])
+        if isinstance(raw_skus, dict):
+            sku_info_list: List[Dict[str, Any]] = raw_skus.get("ae_item_sku_info_d_t_o", [])
+        elif isinstance(raw_skus, list):
+            sku_info_list = raw_skus
+        else:
+            sku_info_list = []
 
         product_id = str(base_info.get("product_id", ""))
         if not product_id:
             return None
 
         title = base_info.get("subject", "").strip()
-        description = base_info.get("detail", "") or properties.get("product_description", "")
+        description = base_info.get("detail", "") or base_info.get("product_description", "")
 
-        # Zdjecia
+        # Zdjecia z image_urls (string z ";")
         images: List[str] = []
         image_urls = multimedia.get("image_urls", "")
         if isinstance(image_urls, str):
@@ -416,52 +442,83 @@ class AliExpressClient:
         stock: int = 0
         currency: str = "PLN"
         variants: List[Dict[str, Any]] = []
+        ship_from_sku: str = ""  # wyciagniete z ae_sku_property_dtos
+
+        for sku in sku_info_list:
+            # Cena: sku_price jest cena zakupu; offer_sale_price moze nie byc
+            sku_price = float(sku.get("sku_price", 0) or 0)
+            offer_price = float(sku.get("offer_sale_price", 0) or 0)
+            effective_price = offer_price if offer_price > 0 else sku_price
+            sku_stock = int(sku.get("sku_available_stock", 0) or 0)
+            sku_id = str(sku.get("sku_id", ""))
+
+            variants.append({
+                "sku_id": sku_id,
+                "price": effective_price,
+                "stock": sku_stock,
+            })
+            if price == 0.0 or (effective_price > 0 and effective_price < price):
+                price = effective_price
+                price_original = sku_price
+                sku_code = sku_id
+            stock += sku_stock
+
+            # ship_from z wlasciwosci SKU ("Ships From")
+            if not ship_from_sku:
+                props = sku.get("ae_sku_property_dtos", [])
+                if isinstance(props, dict):
+                    props = props.get("ae_sku_property_d_t_o", [])
+                for prop in props:
+                    if str(prop.get("sku_property_name", "")).strip() == "Ships From":
+                        ship_from_sku = str(prop.get("sku_property_value", "")).strip()
+                        break
 
         if sku_info_list:
-            for sku in sku_info_list:
-                sku_price = float(sku.get("offer_sale_price", 0) or 0)
-                sku_original = float(sku.get("sku_price", sku_price) or sku_price)
-                sku_stock = int(sku.get("sku_available_stock", 0) or 0)
-                sku_id = str(sku.get("sku_id", ""))
-                variants.append({
-                    "sku_id": sku_id,
-                    "price": sku_price,
-                    "stock": sku_stock,
-                })
-                if price == 0.0 or sku_price < price:
-                    price = sku_price
-                    price_original = sku_original
-                    sku_code = sku_id
-                stock += sku_stock
             currency = sku_info_list[0].get("currency_code", "PLN")
 
         if price == 0.0:
             return None
 
-        # Waga i wymiary opakowania
-        package_info = root.get("package_info_dto", {})
+        # Waga i wymiary
         weight_kg = float(package_info.get("package_weight", 0) or 0)
         length_cm = float(package_info.get("package_length", 0) or 0)
         width_cm = float(package_info.get("package_width", 0) or 0)
         height_cm = float(package_info.get("package_height", 0) or 0)
 
-        # Dostawa
-        ship_from_country = logistics.get("ship_from_country", "CN")
+        # ship_from_country: SKU properties > logistics_info_dto
+        logistics_ship_from = logistics.get("ship_from_country", "")
+        ship_from_raw = ship_from_sku or logistics_ship_from or "CN"
+
+        # Mapowanie nazw krajow na kody ISO
+        COUNTRY_NAME_TO_CODE: Dict[str, str] = {
+            "poland": "PL", "polska": "PL",
+            "germany": "DE", "deutschland": "DE", "niemcy": "DE",
+            "czech republic": "CZ", "czechia": "CZ", "czechy": "CZ",
+            "spain": "ES", "espana": "ES", "espana": "ES", "hiszpania": "ES",
+            "france": "FR", "francja": "FR",
+            "united states": "US", "usa": "US",
+            "china": "CN", "chiny": "CN",
+        }
+        ship_from_upper = ship_from_raw.upper()
+        ship_from_code = COUNTRY_NAME_TO_CODE.get(ship_from_raw.lower(), ship_from_upper)
+
+        # Czas dostawy
         estimated_days = int(logistics.get("delivery_time", 30) or 30)
 
-        # Nadpisanie na podstawie informacji o wysylce
+        # Nadpisanie przez shipping query jesli dostepne
         shipping_root = raw_shipping.get(
             "aliexpress_ds_shipping_info_query_response", {}
         ).get("result", {})
+        if not shipping_root:
+            shipping_root = raw_shipping.get("result", {})
         freight_list = shipping_root.get("freight_list", {}).get("freight_item", [])
-        if freight_list:
-            fastest = None
-            for opt in freight_list:
-                days = int(opt.get("estimate_delivery_days", estimated_days) or estimated_days)
-                if fastest is None or days < fastest:
-                    fastest = days
-            if fastest is not None:
-                estimated_days = fastest
+        if isinstance(freight_list, list) and freight_list:
+            fastest = min(
+                (int(opt.get("estimate_delivery_days", estimated_days) or estimated_days)
+                 for opt in freight_list),
+                default=estimated_days,
+            )
+            estimated_days = fastest
 
         return Product(
             product_id=product_id,
@@ -475,7 +532,7 @@ class AliExpressClient:
             stock=stock,
             seller_id=str(store_info.get("store_id", "")),
             seller_rating=float(store_info.get("communication_rating", 0) or 0),
-            ship_from_country=str(ship_from_country).upper(),
+            ship_from_country=ship_from_code,
             estimated_delivery_days=estimated_days,
             variants=variants,
             weight_kg=weight_kg,
