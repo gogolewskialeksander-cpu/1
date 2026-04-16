@@ -39,6 +39,7 @@ class BaseLinkerClient:
         self,
         token: str,
         inventory_id: str,
+        storage_id: str,
         margin_percent: float,
         logger: Logger,
     ) -> None:
@@ -47,11 +48,13 @@ class BaseLinkerClient:
             token: Token API BaseLinker.
             inventory_id: ID katalogu produktow (inventory_id). Moze byc pusty,
                 wtedy produkty dodajemy do domyslnego katalogu.
+            storage_id: ID magazynu w formacie 'bl_XXXXXX' (np. 'bl_135610').
             margin_percent: Marza do ceny sprzedazy.
             logger: Instancja loggera.
         """
         self.token = token
         self.inventory_id = inventory_id
+        self.storage_id = storage_id
         self.margin_percent = margin_percent
         self.logger = logger
         self._session = requests.Session()
@@ -140,7 +143,7 @@ class BaseLinkerClient:
                 "default": sale_price,
             },
             "stock": {
-                "bl_1": product.stock,
+                self.storage_id: product.stock,
             },
             "images": product.images,
             "features": {

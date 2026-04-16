@@ -37,6 +37,7 @@ class Config:
     anthropic_api_key: str = ""
     baselinker_api_token: str = ""
     baselinker_inventory_id: str = ""
+    baselinker_storage_id: str = "bl_1"
 
     # Filtry biznesowe
     ship_from_countries: List[str] = field(default_factory=lambda: ["PL", "CZ", "DE", "ES", "FR"])
@@ -118,6 +119,14 @@ def _parse_float(raw: Optional[str], default: float) -> float:
         return default
 
 
+def _normalize_storage_id(raw: str) -> str:
+    """Zapewnia prefix 'bl_' w storage_id BaseLinker (np. '135610' -> 'bl_135610')."""
+    raw = raw.strip()
+    if not raw:
+        return "bl_1"
+    return raw if raw.startswith("bl_") else f"bl_{raw}"
+
+
 def load_config(test_mode: bool = False) -> Config:
     """
     Laduje konfiguracje ze zmiennych srodowiskowych.
@@ -140,6 +149,7 @@ def load_config(test_mode: bool = False) -> Config:
         anthropic_api_key=os.getenv("ANTHROPIC_API_KEY", ""),
         baselinker_api_token=os.getenv("BASELINKER_API_TOKEN", ""),
         baselinker_inventory_id=os.getenv("BASELINKER_INVENTORY_ID", ""),
+        baselinker_storage_id=_normalize_storage_id(os.getenv("BASELINKER_STORAGE_ID", "bl_1")),
         ship_from_countries=_parse_countries(os.getenv("SHIP_FROM_COUNTRIES")),
         target_currency=os.getenv("TARGET_CURRENCY", "PLN"),
         target_language=os.getenv("TARGET_LANGUAGE", "pl"),

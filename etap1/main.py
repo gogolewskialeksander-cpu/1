@@ -248,6 +248,7 @@ def run_pipeline(config: Config, args: argparse.Namespace, logger: Logger) -> in
         bl_client = BaseLinkerClient(
             token=config.baselinker_api_token,
             inventory_id=config.baselinker_inventory_id,
+            storage_id=config.baselinker_storage_id,
             margin_percent=config.margin_target_percent,
             logger=logger,
         )
