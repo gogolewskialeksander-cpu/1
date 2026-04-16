@@ -329,23 +329,41 @@ class AliExpressClient:
                 break
             try:
                 raw_product = self.get_product(pid)
+
+                # DEBUG: surowa odpowiedz ds.product.get
+                ds_root = raw_product.get("aliexpress_ds_product_get_response", {})
+                ds_result = ds_root.get("result", {})
+                ds_logistics = ds_result.get("logistics_info_dto", {})
+                raw_ship_from = str(ds_logistics.get("ship_from_country", "BRAK")).upper()
+                ds_ok = bool(ds_result)
+                self.logger.ok(
+                    f"  [{idx}/{len(product_ids)}] {pid} | "
+                    f"DS API: {'OK' if ds_ok else 'BRAK WYNIKU'} | "
+                    f"ship_from_country={raw_ship_from} | "
+                    f"EU={raw_ship_from in eu_set if eu_set else 'brak_filtru'}"
+                )
+                if not ds_ok:
+                    self.logger.warn(f"    => ds.product.get zwrocil pusta odpowiedz: {str(ds_root)[:200]}")
+
                 raw_shipping = self.query_shipping(pid)
                 product = self._parse_product(raw_product, raw_shipping)
                 if product is None:
+                    self.logger.warn(f"    => _parse_product zwrocil None (brak id/tytulu/ceny)")
                     continue
                 # Filtruj po magazynie EU
                 if eu_set and product.ship_from_country not in eu_set:
                     self.logger.warn(
-                        f"  [{idx}] {pid}: pominiety — magazyn {product.ship_from_country} (nie EU)"
+                        f"    => ODRZUCONY — ship_from={product.ship_from_country} "
+                        f"nie w EU {sorted(eu_set)}"
                     )
                     continue
                 products.append(product)
                 self.logger.ok(
-                    f"  [{idx}/{len(product_ids)}] {product.title[:60]} "
-                    f"[{product.ship_from_country}]"
+                    f"    => PRZYJETY: {product.title[:55]} [{product.ship_from_country}] "
+                    f"{product.price:.2f} PLN stock={product.stock}"
                 )
             except AliExpressAPIError as e:
-                self.logger.warn(f"  [{idx}/{len(product_ids)}] {pid}: {e}")
+                self.logger.warn(f"  [{idx}/{len(product_ids)}] {pid}: API error: {e}")
                 continue
             except Exception as e:  # pragma: no cover — defensywne
                 self.logger.warn(f"  [{idx}/{len(product_ids)}] {pid}: nieoczekiwany blad: {e}")
