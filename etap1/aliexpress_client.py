@@ -450,6 +450,7 @@ class AliExpressClient:
 
         # Mapowanie pelnych nazw krajow na kody ISO (uzywane przy parsowaniu SKU)
         COUNTRY_MAP: Dict[str, str] = {
+            # angielskie
             "poland": "PL",
             "germany": "DE", "deutschland": "DE",
             "czech republic": "CZ", "czechia": "CZ",
@@ -460,6 +461,21 @@ class AliExpressClient:
             "united kingdom": "GB", "uk": "GB",
             "united states": "US", "usa": "US",
             "china": "CN",
+            "australia": "AU",
+            "japan": "JP",
+            # polskie
+            "polska": "PL", "polonia": "PL",
+            "niemcy": "DE",
+            "republika czeska": "CZ",
+            "hiszpania": "ES",
+            "francja": "FR",
+            "włochy": "IT", "wlochy": "IT",
+            "holandia": "NL", "niderlandy": "NL",
+            "wielka brytania": "GB", "wielka brytania": "GB",
+            "stany zjednoczone": "US",
+            "japonia": "JP",
+            "australia": "AU",
+            "chiny": "CN",
         }
 
         # Ceny i SKU
@@ -544,7 +560,7 @@ class AliExpressClient:
         logistics_code = to_code(logistics_ship_from) if logistics_ship_from else ""
 
         # Preferuj EU wariant jesli jakikolwiek SKU ma EU magazyn
-        EU_CODES = {"PL", "DE", "CZ", "ES", "FR", "IT", "NL", "GB"}
+        EU_CODES = {"PL", "DE", "CZ", "ES", "FR", "IT", "NL", "GB", "BE", "AT", "SE", "DK", "FI", "PT", "HU", "RO", "SK", "HR", "SI", "BG", "LT", "LV", "EE"}
         eu_codes_found = [c for c in sku_codes if c in EU_CODES]
         if eu_codes_found:
             ship_from_code = eu_codes_found[0]
