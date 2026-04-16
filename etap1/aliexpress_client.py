@@ -16,6 +16,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import random
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -31,30 +33,27 @@ PARTNER_ID: str = "iop-sdk-python-20220609"
 DAILY_REQUEST_LIMIT: int = 1000
 REQUEST_TIMEOUT_SECONDS: int = 30
 
-# Produkty z EU/Local+ magazynow (zweryfikowane recznie)
-# Uzupelnij liste o kolejne ID jesli potrzebujesz wiecej produktow.
-SEED_PRODUCT_IDS: List[str] = [
-    "1005009674342871",
-    "1005008529307600",
-    "1005009522530165",
-    "1005011931202367",
-    "1005011681407049",
-    "1005011657852671",
-    "1005007077687499",
-    "1005009114857306",
-    "1005009260839172",
-    "1005009770876958",
-    "1005007853697935",
-    "1005009667701880",
-    "1005008984834308",
-    "1005007813226384",
-    "1005009887005491",
-    "1005008121531331",
-    "1005010687254406",
-    "32883030040",
-    "1005009685411506",
-    "1005008378098130",
-]
+SCRAPE_TARGET: str = "https://www.aliexpress.com/wholesale"
+SCRAPE_MIN_IDS: int = 50
+SCRAPE_MAX_PAGES: int = 10
+SCRAPE_DELAY_RANGE: tuple = (1.0, 3.0)
+
+_SCRAPE_HEADERS: Dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Cache-Control": "max-age=0",
+}
 
 
 @dataclass
@@ -264,6 +263,114 @@ class AliExpressClient:
             },
         )
 
+    def _scrape_product_ids(
+        self,
+        ship_to: str,
+        keyword: str,
+        target: int,
+    ) -> List[str]:
+        """
+        Scrappuje AliExpress Local+ (/wholesale?shipto=PL&local_sale=y).
+
+        Zwraca liste unikalnych product_id lub [] jesli AliExpress zablokuje
+        request (503/403 z datacenter IP — wtedy uzyj VPN/proxy rezydencjalnego).
+        """
+        collected: List[str] = []
+        seen: set = set()
+
+        scrape_session = requests.Session()
+        scrape_session.headers.update(_SCRAPE_HEADERS)
+
+        self.logger.ok(f"Scraping AliExpress Local+ (shipto={ship_to}, cel={target} ID)...")
+
+        for page in range(1, SCRAPE_MAX_PAGES + 1):
+            if len(collected) >= target:
+                break
+            params = {
+                "SearchText": keyword or "",
+                "shipto": ship_to,
+                "local_sale": "y",
+                "page": str(page),
+                "SortType": "total_tranpro_desc",
+            }
+            try:
+                resp = scrape_session.get(
+                    SCRAPE_TARGET,
+                    params=params,
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+                if resp.status_code in (403, 429, 503):
+                    self.logger.warn(
+                        f"  Scraping zablokowany HTTP {resp.status_code} "
+                        f"(serwer/datacenter IP — uzyj proxy rezydencjalnego)"
+                    )
+                    break
+                resp.raise_for_status()
+                html = resp.text
+
+                found = re.findall(r"/item/(\d{8,19})\.html", html)
+                new_ids = [pid for pid in found if pid not in seen]
+                for pid in new_ids:
+                    seen.add(pid)
+                    collected.append(pid)
+
+                self.logger.ok(
+                    f"  strona {page}: +{len(new_ids)} nowych ID "
+                    f"(lacznie {len(collected)})"
+                )
+
+                if not found:
+                    self.logger.warn(f"  strona {page}: brak linkow — koniec wynikow")
+                    break
+
+                if page < SCRAPE_MAX_PAGES and len(collected) < target:
+                    time.sleep(random.uniform(*SCRAPE_DELAY_RANGE))
+
+            except requests.RequestException as e:
+                self.logger.warn(f"  strona {page}: blad HTTP — {e}")
+                break
+
+        return collected
+
+    def _search_via_api(self, ship_to: str, limit: int) -> List[str]:
+        """
+        Wyszukuje produkty przez IOP API aliexpress.ds.product.search.
+
+        Fallback gdy scraping jest zablokowany.
+        """
+        self.logger.ok(f"Fallback: aliexpress.ds.product.search (shipto={ship_to})...")
+        ids: List[str] = []
+        try:
+            data = self._call(
+                "aliexpress.ds.product.search",
+                {
+                    "ship_to_country": ship_to,
+                    "target_language": "PL",
+                    "target_currency": "PLN",
+                    "page_no": "1",
+                    "page_size": str(min(limit, 50)),
+                    "sort": "SALE_PRICE_ASC",
+                },
+            )
+            # Rozne klucze odpowiedzi zaleznie od wersji API
+            root = (
+                data.get("aliexpress_ds_product_search_response", {})
+                or data.get("result", {})
+            )
+            items = (
+                root.get("products", {}).get("product", [])
+                or root.get("data", {}).get("products", [])
+                or []
+            )
+            for item in items:
+                pid = str(item.get("product_id", item.get("id", "")))
+                if pid:
+                    ids.append(pid)
+            self.logger.ok(f"  API search zwrocil {len(ids)} produktow")
+        except AliExpressAPIError as e:
+            self.logger.warn(f"  API search nieudany: {e}")
+        return ids
+
     def search_products(
         self,
         ship_from_countries: List[str],
@@ -271,22 +378,35 @@ class AliExpressClient:
         keyword: str = "",
     ) -> List[str]:
         """
-        Zwraca liste product_id ze statycznej listy SEED_PRODUCT_IDS.
+        Zwraca product_id do sprawdzenia przez DS API.
 
-        Produkty zebrane recznym przegladem AliExpress Local+ (shipto=PL,
-        local_sale=y). Filtrowanie po ship_from_country (EU) odbywa sie
-        pozniej w fetch_products() na podstawie odpowiedzi ds.product.get.
+        Kolejnosc:
+        1. Scraping AliExpress Local+ (dziala z IP rezydencjalnych/VPN)
+        2. Fallback: aliexpress.ds.product.search przez IOP API
 
         Args:
-            ship_from_countries: Lista kodow krajow EU — uzywana w fetch_products().
-            limit: Maksymalna liczba produktow do sprawdzenia.
-
-        Returns:
-            Lista identyfikatorow produktow do sprawdzenia przez DS API.
+            ship_from_countries: Lista kodow krajow EU (uzywany pierwszy).
+            limit: Maksymalna liczba ID do zwrocenia.
+            keyword: Fraza wyszukiwania (opcjonalna).
         """
-        ids = SEED_PRODUCT_IDS[:limit]
-        self.logger.ok(f"SEED: {len(ids)} product_id do sprawdzenia przez DS API")
-        return ids
+        ship_to = ship_from_countries[0] if ship_from_countries else "PL"
+        target = max(limit, SCRAPE_MIN_IDS)
+
+        ids = self._scrape_product_ids(ship_to, keyword, target)
+
+        if not ids:
+            self.logger.warn("Scraping nieudany — proba przez IOP API...")
+            ids = self._search_via_api(ship_to, limit)
+
+        if not ids:
+            raise AliExpressAPIError(
+                "Brak produktow: scraping zablokowany i IOP search nieudany. "
+                "Uruchom z VPN/proxy lub sprawdz uprawnienia aplikacji."
+            )
+
+        result = ids[:limit]
+        self.logger.ok(f"Lacznie {len(result)} product_id do sprawdzenia przez DS API")
+        return result
 
     def fetch_products(
         self,
