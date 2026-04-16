@@ -276,25 +276,27 @@ class AliExpressClient:
                     "page_size": str(min(limit, 50)),
                 },
             )
-            root = (
-                data.get("aliexpress_ds_recommend_feed_get_response", {})
-                or data
-            )
-            result = root.get("result", root)
-            products = (
-                result.get("products", {}).get("product", [])
-                or result.get("product_list", {}).get("product", [])
-                or result.get("products", [])
-                or []
-            )
-            if isinstance(products, dict):
-                products = products.get("product", [])
-            for item in (products or []):
-                pid = str(item.get("product_id", item.get("productId", "")))
+            root = data.get("aliexpress_ds_recommend_feed_get_response", {}) or data
+            result = root.get("result", root) if isinstance(root, dict) else {}
+
+            # "products" moze byc lista lub dict {"product": [...]}
+            raw = result.get("products") if isinstance(result, dict) else None
+            if isinstance(raw, list):
+                products = raw
+            elif isinstance(raw, dict):
+                products = raw.get("product", [])
+            else:
+                products = []
+
+            for item in products:
+                if not isinstance(item, dict):
+                    continue
+                pid = str(item.get("product_id", item.get("productId", ""))).strip()
                 if pid and pid not in ids:
                     ids.append(pid)
-        except AliExpressAPIError as e:
-            self.logger.warn(f"  feed {feed_name!r} niedostepny: {e}")
+
+        except (AliExpressAPIError, Exception) as e:
+            self.logger.warn(f"  feed {feed_name!r} blad: {e}")
         return ids
 
     def search_products(
