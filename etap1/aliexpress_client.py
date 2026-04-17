@@ -50,6 +50,17 @@ DS_SEARCH_KEYWORDS: List[str] = [
     "car accessories",
 ]
 
+# Fallback gdy wszystkie feedy i text.search sa puste
+SEED_PRODUCT_IDS: List[str] = [
+    "1005009674342871", "1005008529307600", "1005009522530165",
+    "1005011931202367", "1005011681407049", "1005011657852671",
+    "1005007077687499", "1005009114857306", "1005009260839172",
+    "1005009770876958", "1005007853697935", "1005009667701880",
+    "1005008984834308", "1005007813226384", "1005009887005491",
+    "1005008121531331", "1005010687254406", "32883030040",
+    "1005009685411506", "1005008378098130",
+]
+
 
 @dataclass
 class Product:
@@ -258,6 +269,48 @@ class AliExpressClient:
             },
         )
 
+    def _diagnose_endpoints(self) -> None:
+        """
+        Diagnostyka: wywoluje dwa nowe endpointy i drukuje pelne odpowiedzi JSON.
+
+        1. aliexpress.ds.feedname.get          — bez parametrow biznesowych
+        2. /ds/recommend/feed/get (REST slash)  — inny niz aliexpress.ds.recommend.feed.get;
+           base_string podpisu zaczyna sie od "/ds/recommend/feed/get"
+        """
+        separator = "=" * 60
+
+        # ── 1. aliexpress.ds.feedname.get ────────────────────────────
+        self.logger.ok(f"\n{separator}")
+        self.logger.ok("DIAGNOZA #1: aliexpress.ds.feedname.get")
+        self.logger.ok(separator)
+        try:
+            resp1 = self._call("aliexpress.ds.feedname.get", {})
+            self.logger.ok(json.dumps(resp1, indent=2, ensure_ascii=False))
+        except Exception as e:
+            self.logger.warn(f"BLAD: {e}")
+
+        # ── 2. /ds/recommend/feed/get (REST slash-path) ───────────────
+        self.logger.ok(f"\n{separator}")
+        self.logger.ok("DIAGNOZA #2: /ds/recommend/feed/get  (REST slash-path)")
+        self.logger.ok(separator)
+        try:
+            resp2 = self._call(
+                "/ds/recommend/feed/get",
+                {
+                    "country": "PL",
+                    "target_currency": "PLN",
+                    "target_language": "PL",
+                    "page_size": "20",
+                    "page_no": "1",
+                    "feed_name": "DS_bestseller_en",
+                },
+            )
+            self.logger.ok(json.dumps(resp2, indent=2, ensure_ascii=False))
+        except Exception as e:
+            self.logger.warn(f"BLAD: {e}")
+
+        self.logger.ok(separator + "\n")
+
     def _get_feed_names(self) -> List[str]:
         """
         Pobiera dostepne nazwy feedow przez aliexpress.ds.feedname.get.
@@ -455,6 +508,9 @@ class AliExpressClient:
         seen: set = set()
         country = ship_from_countries[0] if ship_from_countries else "PL"
 
+        # Diagnostyka nowych endpointow (drukuje surowe odpowiedzi JSON)
+        self._diagnose_endpoints()
+
         # Krok 1: text.search po wielu keywords
         keywords = [keyword] if keyword else DS_SEARCH_KEYWORDS
         self.logger.ok(
@@ -513,10 +569,14 @@ class AliExpressClient:
             self.logger.ok(f"recommend.feed: {len(result)} product_id do sprawdzenia")
             return result
 
-        raise AliExpressAPIError(
-            "Brak produktow w feedach DS. "
-            "Dodaj produkty recznie do SEED_PRODUCT_IDS lub poczekaj na aktywacje konta."
+        # Ostateczny fallback — znane produkty EU
+        self.logger.warn(
+            "Wszystkie zrodla puste. "
+            f"Fallback na SEED_PRODUCT_IDS ({len(SEED_PRODUCT_IDS)} znanych produktow EU)."
         )
+        result = SEED_PRODUCT_IDS[:limit]
+        self.logger.ok(f"SEED fallback: {len(result)} product_id do sprawdzenia")
+        return result
 
     def fetch_products(
         self,
