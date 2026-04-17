@@ -38,7 +38,19 @@ DS_FEED_NAMES: List[str] = [
     "DS_NEW_ARRIVAL",
 ]
 
-# Fallback gdy wszystkie feedy sa puste (nowe konto bez dostepu do feedow)
+# Slowa kluczowe do text.search — roznorodne kategorie
+DS_SEARCH_KEYWORDS: List[str] = [
+    "phone holder",
+    "led strip",
+    "smartwatch",
+    "camping chair",
+    "power bank",
+    "bluetooth speaker",
+    "kitchen gadget",
+    "car accessories",
+]
+
+# Ostateczny fallback gdy text.search i feedy sa niedostepne
 SEED_PRODUCT_IDS: List[str] = [
     "1005009674342871", "1005008529307600", "1005009522530165",
     "1005011931202367", "1005011681407049", "1005011657852671",
@@ -257,6 +269,65 @@ class AliExpressClient:
             },
         )
 
+    def _ids_from_text_search(
+        self,
+        keyword: str,
+        country: str,
+        page_size: int = 50,
+    ) -> List[str]:
+        """
+        Wyszukuje product_id przez aliexpress.ds.text.search.
+
+        Parametry camelCase zgodnie ze specyfikacja API.
+        Zwraca [] jesli blad lub brak wynikow.
+        """
+        ids: List[str] = []
+        try:
+            data = self._call(
+                "aliexpress.ds.text.search",
+                {
+                    "keyWord": keyword,
+                    "countryCode": country,
+                    "currency": "PLN",
+                    "local": country,
+                    "pageSize": str(page_size),
+                    "pageIndex": "1",
+                    "sortBy": "orders,desc",
+                },
+            )
+            root = data.get("aliexpress_ds_text_search_response", {}) or data
+            result = root.get("result", root) if isinstance(root, dict) else {}
+
+            # Produkty moga byc pod rozymi kluczami
+            raw = None
+            if isinstance(result, dict):
+                raw = (
+                    result.get("products")
+                    or result.get("product_list")
+                    or result.get("data")
+                    or []
+                )
+            if isinstance(raw, dict):
+                raw = raw.get("product", raw.get("products", raw.get("item", [])))
+            if not isinstance(raw, list):
+                raw = []
+
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                pid = str(
+                    item.get("product_id")
+                    or item.get("productId")
+                    or item.get("item_id")
+                    or ""
+                ).strip()
+                if pid and pid not in ids:
+                    ids.append(pid)
+
+        except Exception as e:
+            self.logger.warn(f"  text.search {keyword!r} blad: {e}")
+        return ids
+
     def _ids_from_feed_itemids(self, feed_name: str, limit: int) -> List[str]:
         """
         Pobiera product_id przez aliexpress.ds.feed.itemids.get.
@@ -349,54 +420,80 @@ class AliExpressClient:
         """
         Zwraca product_id do sprawdzenia przez DS API.
 
-        Kolejnosc:
-        1. Feedy DS (DS_bestseller_en, DS_HOT_SELLER, DS_NEW_ARRIVAL)
-        2. Fallback: SEED_PRODUCT_IDS gdy wszystkie feedy puste (nowe konto)
+        Kolejnosc prób:
+        1. aliexpress.ds.text.search — po wielu keywords, 50 ID kazdy
+        2. aliexpress.ds.feed.itemids.get — lekki feed, tylko ID
+        3. aliexpress.ds.recommend.feed.get — pelny feed
+        4. SEED_PRODUCT_IDS — ostateczny fallback (znane produkty EU)
 
         Args:
-            ship_from_countries: Lista kodow krajow EU.
+            ship_from_countries: Lista kodow krajow EU (uzywany pierwszy).
             limit: Maksymalna liczba ID do zwrocenia.
+            keyword: Nadpisuje domyslna liste keywords gdy podany.
         """
         ids: List[str] = []
         seen: set = set()
+        country = ship_from_countries[0] if ship_from_countries else "PL"
 
-        # Krok 1: feed.itemids.get (lzejszy endpoint, tylko ID)
-        self.logger.ok("Szukam produktow przez aliexpress.ds.feed.itemids.get...")
+        # Krok 1: text.search po wielu keywords
+        keywords = [keyword] if keyword else DS_SEARCH_KEYWORDS
+        self.logger.ok(
+            f"Szukam produktow przez aliexpress.ds.text.search "
+            f"({len(keywords)} keywords, country={country})..."
+        )
+        for kw in keywords:
+            if len(ids) >= limit:
+                break
+            new_ids = self._ids_from_text_search(kw, country, page_size=50)
+            new = [pid for pid in new_ids if pid not in seen]
+            ids.extend(new)
+            seen.update(new)
+            self.logger.ok(
+                f"  {kw!r}: {len(new_ids)} wynikow ({len(new)} nowych, lacznie {len(ids)})"
+            )
+
+        if ids:
+            result = ids[:limit]
+            self.logger.ok(f"text.search: {len(result)} product_id do sprawdzenia")
+            return result
+
+        # Krok 2: feed.itemids.get
+        self.logger.warn("text.search puste — proba przez feed.itemids.get...")
         for feed_name in DS_FEED_NAMES:
             if len(ids) >= limit:
                 break
             self.logger.ok(f"  feed.itemids: {feed_name!r}...")
-            feed_ids = self._ids_from_feed_itemids(feed_name, limit)
-            new = [pid for pid in feed_ids if pid not in seen]
+            new_ids = self._ids_from_feed_itemids(feed_name, limit)
+            new = [pid for pid in new_ids if pid not in seen]
             ids.extend(new)
             seen.update(new)
-            self.logger.ok(f"  => {len(feed_ids)} ID ({len(new)} nowych, lacznie {len(ids)})")
+            self.logger.ok(f"  => {len(new_ids)} ID ({len(new)} nowych, lacznie {len(ids)})")
 
         if ids:
             result = ids[:limit]
             self.logger.ok(f"feed.itemids: {len(result)} product_id do sprawdzenia")
             return result
 
-        # Krok 2: recommend.feed.get (zwraca pelne dane, wyciagamy ID)
+        # Krok 3: recommend.feed.get
         self.logger.warn("feed.itemids puste — proba przez recommend.feed.get...")
         for feed_name in DS_FEED_NAMES:
             if len(ids) >= limit:
                 break
             self.logger.ok(f"  recommend.feed: {feed_name!r}...")
-            feed_ids = self._ids_from_feed(feed_name, limit)
-            new = [pid for pid in feed_ids if pid not in seen]
+            new_ids = self._ids_from_feed(feed_name, limit)
+            new = [pid for pid in new_ids if pid not in seen]
             ids.extend(new)
             seen.update(new)
-            self.logger.ok(f"  => {len(feed_ids)} ID ({len(new)} nowych, lacznie {len(ids)})")
+            self.logger.ok(f"  => {len(new_ids)} ID ({len(new)} nowych, lacznie {len(ids)})")
 
         if ids:
             result = ids[:limit]
             self.logger.ok(f"recommend.feed: {len(result)} product_id do sprawdzenia")
             return result
 
-        # Krok 3: SEED_PRODUCT_IDS — ostateczny fallback (znane produkty EU)
+        # Krok 4: SEED_PRODUCT_IDS — ostateczny fallback
         self.logger.warn(
-            f"Wszystkie feedy puste. "
+            f"Wszystkie zrodla puste. "
             f"Fallback na SEED_PRODUCT_IDS ({len(SEED_PRODUCT_IDS)} znanych produktow EU)."
         )
         result = SEED_PRODUCT_IDS[:limit]
