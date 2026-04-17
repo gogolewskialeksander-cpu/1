@@ -142,6 +142,13 @@ class AliExpressClient:
         ).hexdigest().upper()
         return signature
 
+    @staticmethod
+    def _parse_ban_seconds(msg: str) -> int:
+        """Wyciaga liczbe sekund z 'This ban will last X seconds'."""
+        import re as _re
+        m = _re.search(r"last\s+(\d+)\s+second", msg, _re.IGNORECASE)
+        return int(m.group(1)) if m else 60  # domyslnie 60s jesli nie znaleziono
+
     def _call(
         self,
         method: str,
@@ -200,9 +207,23 @@ class AliExpressClient:
                 data = response.json()
                 if isinstance(data, dict) and "error_response" in data:
                     err = data["error_response"]
+                    msg = err.get("msg", "") or err.get("sub_msg", "") or "unknown"
+                    code = err.get("code", "?")
+
+                    # AppApiCallLimit — wyciagnij czas bana i poczekaj
+                    if "AppApiCallLimit" in msg or "AppApiCallLimit" in str(code):
+                        ban_seconds = self._parse_ban_seconds(msg)
+                        wait = ban_seconds + 2
+                        self.logger.warn(
+                            f"Rate limit (AppApiCallLimit): ban {ban_seconds}s. "
+                            f"Czekam {wait}s przed ponowieniem..."
+                        )
+                        time.sleep(wait)
+                        backoff_seconds = 2.0  # reset — nie podwajaj po rate limit
+                        continue
+
                     raise AliExpressAPIError(
-                        f"AliExpress API error: {err.get('msg', 'unknown')} "
-                        f"(code={err.get('code', '?')})"
+                        f"AliExpress API error: {msg} (code={code})"
                     )
                 return data
             except (requests.RequestException, AliExpressAPIError, ValueError) as e:
@@ -597,6 +618,7 @@ class AliExpressClient:
             if len(products) >= limit:
                 break
             try:
+                time.sleep(0.5)  # 0.5s miedzy wywolaniami zeby nie trafc w limit
                 raw_product = self.get_product(pid)
 
                 # DEBUG: surowa odpowiedz ds.product.get
