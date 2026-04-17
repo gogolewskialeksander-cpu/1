@@ -32,15 +32,21 @@ DAILY_REQUEST_LIMIT: int = 1000
 REQUEST_TIMEOUT_SECONDS: int = 30
 
 # Rzeczywiste feed names z aliexpress.ds.feedname.get
-# EU Local Stock — gwarantuja ship_from w PL/DE/ES/FR
 DS_FEED_NAMES: List[str] = [
-    "AEB_Poland_LocalStock_PlatformOperation_20241028",   # PL ~199k produktow
-    "AEB_DE_LocalStock_PlatformOperation_20241023",       # DE ~1710 produktow
-    "AEB_ES_LocalStock_PlatformOperation_20240926",       # ES ~2220 produktow
-    "AEB_FR_LocalStock_PlatformOperation_20240926",       # FR ~2160 produktow
-    "DS_Home&Kitchen_bestsellers",                        # ~13k produktow
-    "DS_Sports&Outdoors_bestsellers",                     # ~27k produktow
+    "AEB_Poland_LocalStock_PlatformOperation_20241028",   # PL ~199k
+    "AEB_Droplo_BestsellersItems_20241016",               # ~201k
+    "AEB_EAN Items",                                       # ~198k
+    "AEB_DE_LocalStock_PlatformOperation_20241023",       # DE ~1710
+    "AEB_ES_LocalStock_PlatformOperation_20240926",       # ES ~2220
+    "AEB_FR_LocalStock_PlatformOperation_20240926",       # FR ~2160
+    "DS_Sports&Outdoors_bestsellers",                     # ~27k
+    "DS_Automobile&Accessories_bestsellers",              # ~21k
+    "DS_ConsumerElectronics_bestsellers",                 # ~20k
+    "DS_Home&Kitchen_bestsellers",                        # ~13k
 ]
+
+FEED_PAGE_SIZE: int = 50
+FEED_MAX_PAGES: int = 20   # max 20 × 50 = 1000 ID per feed
 
 # Slowa kluczowe do text.search — fallback gdy feedy puste
 DS_SEARCH_KEYWORDS: List[str] = [
@@ -456,45 +462,64 @@ class AliExpressClient:
 
     def _ids_from_feed(self, feed_name: str, limit: int) -> List[str]:
         """
-        Pobiera product_id z feeda DS aliexpress.ds.recommend.feed.get.
+        Pobiera product_id z aliexpress.ds.recommend.feed.get z paginacja.
 
-        Zwraca [] jesli feed jest pusty lub niedostepny (nowe konto).
+        Przechodzi przez kolejne strony (max FEED_MAX_PAGES) az zbierze
+        wymagana liczbe ID lub strona bedzie pusta.
         """
         ids: List[str] = []
-        try:
-            data = self._call(
-                "aliexpress.ds.recommend.feed.get",
-                {
-                    "feed_name": feed_name,
-                    "country": "PL",
-                    "target_currency": "PLN",
-                    "target_language": "PL",
-                    "page_no": "1",
-                    "page_size": str(min(limit, 50)),
-                },
-            )
-            root = data.get("aliexpress_ds_recommend_feed_get_response", {}) or data
-            result = root.get("result", root) if isinstance(root, dict) else {}
+        seen: set = set()
 
-            # "products" moze byc lista lub dict {"product": [...]}
-            raw = result.get("products") if isinstance(result, dict) else None
-            if isinstance(raw, list):
-                products = raw
-            elif isinstance(raw, dict):
-                products = raw.get("product", [])
-            else:
-                products = []
+        for page_no in range(1, FEED_MAX_PAGES + 1):
+            if len(ids) >= limit:
+                break
+            try:
+                data = self._call(
+                    "aliexpress.ds.recommend.feed.get",
+                    {
+                        "feed_name": feed_name,
+                        "country": "PL",
+                        "target_currency": "PLN",
+                        "target_language": "PL",
+                        "page_no": str(page_no),
+                        "page_size": str(FEED_PAGE_SIZE),
+                    },
+                )
+                root = data.get("aliexpress_ds_recommend_feed_get_response", {}) or data
+                result = root.get("result", root) if isinstance(root, dict) else {}
 
-            for item in products:
-                if not isinstance(item, dict):
-                    continue
-                pid = str(item.get("product_id", item.get("productId", ""))).strip()
-                if pid and pid not in ids:
-                    ids.append(pid)
+                raw = result.get("products") if isinstance(result, dict) else None
+                if isinstance(raw, list):
+                    page_items = raw
+                elif isinstance(raw, dict):
+                    page_items = raw.get("product", [])
+                else:
+                    page_items = []
 
-        except (AliExpressAPIError, Exception) as e:
-            self.logger.warn(f"  feed {feed_name!r} blad: {e}")
-        return ids
+                if not page_items:
+                    break  # koniec feedu
+
+                for item in page_items:
+                    if not isinstance(item, dict):
+                        continue
+                    pid = str(item.get("product_id", item.get("productId", ""))).strip()
+                    if pid and pid not in seen:
+                        seen.add(pid)
+                        ids.append(pid)
+
+                self.logger.ok(
+                    f"    strona {page_no}: +{len(page_items)} produktow "
+                    f"(lacznie {len(ids)})"
+                )
+
+                if len(page_items) < FEED_PAGE_SIZE:
+                    break  # ostatnia niepelna strona = koniec feedu
+
+            except Exception as e:
+                self.logger.warn(f"    strona {page_no} blad: {e}")
+                break
+
+        return ids[:limit]
 
     def search_products(
         self,
@@ -618,7 +643,7 @@ class AliExpressClient:
             if len(products) >= limit:
                 break
             try:
-                time.sleep(0.5)  # 0.5s miedzy wywolaniami zeby nie trafc w limit
+                time.sleep(1.0)  # 1s miedzy wywolaniami ds.product.get
                 raw_product = self.get_product(pid)
 
                 # DEBUG: surowa odpowiedz ds.product.get
