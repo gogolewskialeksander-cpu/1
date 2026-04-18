@@ -726,7 +726,7 @@ class AliExpressClient:
                     self.logger.warn(f"    => pusta odpowiedz: {str(raw_product)[:300]}")
 
                 raw_shipping = self.query_shipping(pid)
-                product = self._parse_product(raw_product, raw_shipping)
+                product = self._parse_product(raw_product, raw_shipping, allowed_countries=eu_set)
                 if product is None:
                     self.logger.warn(f"    => _parse_product zwrocil None (brak id/tytulu/ceny)")
                     continue
@@ -755,6 +755,7 @@ class AliExpressClient:
         self,
         raw_product: Dict[str, Any],
         raw_shipping: Dict[str, Any],
+        allowed_countries: Optional[set] = None,
     ) -> Optional[Product]:
         """
         Konwertuje surowa odpowiedz API na obiekt Product.
@@ -910,11 +911,16 @@ class AliExpressClient:
         sku_codes = [to_code(v) for v in all_ship_from_values]
         logistics_code = to_code(logistics_ship_from) if logistics_ship_from else ""
 
-        # Preferuj EU wariant jesli jakikolwiek SKU ma EU magazyn
-        EU_CODES = {"PL", "DE", "CZ", "ES", "FR", "IT", "NL", "GB", "BE", "AT", "SE", "DK", "FI", "PT", "HU", "RO", "SK", "HR", "SI", "BG", "LT", "LV", "EE"}
-        eu_codes_found = [c for c in sku_codes if c in EU_CODES]
-        if eu_codes_found:
-            ship_from_code = eu_codes_found[0]
+        # Priorytet: 1) kraj z allowed_countries, 2) dowolny kraj EU, 3) cokolwiek
+        # GB usuniete — Wielka Brytania nie jest czlonkiem UE od Brexitu
+        EU_CODES = {"PL", "DE", "CZ", "ES", "FR", "IT", "NL", "BE", "AT", "SE", "DK", "FI", "PT", "HU", "RO", "SK", "HR", "SI", "BG", "LT", "LV", "EE"}
+        allowed = allowed_countries or set()
+        allowed_found = [c for c in sku_codes if c in allowed]
+        eu_found = [c for c in sku_codes if c in EU_CODES]
+        if allowed_found:
+            ship_from_code = allowed_found[0]
+        elif eu_found:
+            ship_from_code = eu_found[0]
         elif sku_codes:
             ship_from_code = sku_codes[0]
         elif logistics_code:
