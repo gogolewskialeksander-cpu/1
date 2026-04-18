@@ -464,15 +464,20 @@ class AliExpressClient:
         """
         Pobiera product_id z aliexpress.ds.recommend.feed.get z paginacja.
 
-        Przechodzi przez kolejne strony (max FEED_MAX_PAGES) az zbierze
-        wymagana liczbe ID lub strona bedzie pusta.
+        Zatrzymuje sie gdy:
+        - zebrano wymagana liczbe ID (limit)
+        - 10 pustych stron z rzędu → przejdź do następnego feeda
+        - 500 stron ogółem → zabezpieczenie przed infinite loop
         """
         ids: List[str] = []
         seen: set = set()
+        empty_streak: int = 0
+        MAX_EMPTY_STREAK: int = 10
+        MAX_TOTAL_PAGES: int = 500
+        page_no: int = 0
 
-        for page_no in range(1, FEED_MAX_PAGES + 1):
-            if len(ids) >= limit:
-                break
+        while len(ids) < limit and page_no < MAX_TOTAL_PAGES:
+            page_no += 1
             try:
                 data = self._call(
                     "aliexpress.ds.recommend.feed.get",
@@ -497,8 +502,22 @@ class AliExpressClient:
                     page_items = []
 
                 if not page_items:
-                    break  # koniec feedu
+                    empty_streak += 1
+                    self.logger.warn(
+                        f"    strona {page_no}: pusta "
+                        f"({empty_streak}/{MAX_EMPTY_STREAK} z rzędu)"
+                    )
+                    if empty_streak >= MAX_EMPTY_STREAK:
+                        self.logger.warn(
+                            f"    {MAX_EMPTY_STREAK} pustych stron z rzędu — "
+                            "przechodzę do następnego feeda"
+                        )
+                        break
+                    time.sleep(1.0)
+                    continue
 
+                empty_streak = 0  # reset licznika pustych stron
+                new_count = 0
                 for item in page_items:
                     if not isinstance(item, dict):
                         continue
@@ -506,20 +525,21 @@ class AliExpressClient:
                     if pid and pid not in seen:
                         seen.add(pid)
                         ids.append(pid)
+                        new_count += 1
 
                 self.logger.ok(
-                    f"    strona {page_no}: +{len(page_items)} produktow "
-                    f"(lacznie {len(ids)})"
+                    f"    strona {page_no}: +{new_count} nowych "
+                    f"(strona={len(page_items)}, lacznie={len(ids)})"
                 )
 
-                # Zatrzymaj tylko gdy strona pusta (nie gdy niepelna)
-                # API moze zwracac <50 elementow mimo ze sa kolejne strony
                 if len(ids) < limit:
-                    time.sleep(1.0)  # 1s miedzy stronami feedu
+                    time.sleep(1.0)
 
             except Exception as e:
                 self.logger.warn(f"    strona {page_no} blad: {e}")
                 break
+
+        return ids[:limit]
 
         return ids[:limit]
 
