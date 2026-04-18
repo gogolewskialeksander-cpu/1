@@ -515,6 +515,9 @@ class AliExpressClient:
                 if len(page_items) < FEED_PAGE_SIZE:
                     break  # ostatnia niepelna strona = koniec feedu
 
+                if len(ids) < limit:
+                    time.sleep(1.0)  # 1s miedzy stronami feedu
+
             except Exception as e:
                 self.logger.warn(f"    strona {page_no} blad: {e}")
                 break
