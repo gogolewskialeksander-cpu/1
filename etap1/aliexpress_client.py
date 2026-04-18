@@ -512,9 +512,8 @@ class AliExpressClient:
                     f"(lacznie {len(ids)})"
                 )
 
-                if len(page_items) < FEED_PAGE_SIZE:
-                    break  # ostatnia niepelna strona = koniec feedu
-
+                # Zatrzymaj tylko gdy strona pusta (nie gdy niepelna)
+                # API moze zwracac <50 elementow mimo ze sa kolejne strony
                 if len(ids) < limit:
                     time.sleep(1.0)  # 1s miedzy stronami feedu
 
