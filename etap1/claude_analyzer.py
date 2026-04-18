@@ -24,8 +24,8 @@ from logger import Logger
 
 
 CLAUDE_MODEL: str = "claude-sonnet-4-20250514"
-BATCH_SIZE: int = 10
-MAX_OUTPUT_TOKENS: int = 4096
+BATCH_SIZE: int = 50
+MAX_OUTPUT_TOKENS: int = 16000
 
 
 SYSTEM_PROMPT: str = """Jestes ekspertem e-commerce specjalizujacym sie w polskim rynku Allegro.
