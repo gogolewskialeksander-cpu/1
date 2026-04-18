@@ -471,13 +471,13 @@ class AliExpressClient:
 
         Zatrzymuje sie gdy:
         - zebrano wymagana liczbe ID (limit)
-        - 10 pustych stron z rzędu → przejdź do następnego feeda
+        - 20 kolejnych stron bez nowych produktow → feed wyczerpany, przejdź do następnego
         - 500 stron ogółem → zabezpieczenie przed infinite loop
         """
         ids: List[str] = []
         seen: set = set(exclude_ids) if exclude_ids else set()
-        empty_streak: int = 0
-        MAX_EMPTY_STREAK: int = 10
+        no_new_streak: int = 0
+        MAX_NO_NEW_STREAK: int = 20
         MAX_TOTAL_PAGES: int = 500
         page_no: int = 0
 
@@ -506,22 +506,6 @@ class AliExpressClient:
                 else:
                     page_items = []
 
-                if not page_items:
-                    empty_streak += 1
-                    self.logger.warn(
-                        f"    strona {page_no}: pusta "
-                        f"({empty_streak}/{MAX_EMPTY_STREAK} z rzędu)"
-                    )
-                    if empty_streak >= MAX_EMPTY_STREAK:
-                        self.logger.warn(
-                            f"    {MAX_EMPTY_STREAK} pustych stron z rzędu — "
-                            "przechodzę do następnego feeda"
-                        )
-                        break
-                    time.sleep(1.0)
-                    continue
-
-                empty_streak = 0  # reset licznika pustych stron
                 new_count = 0
                 for item in page_items:
                     if not isinstance(item, dict):
@@ -532,10 +516,24 @@ class AliExpressClient:
                         ids.append(pid)
                         new_count += 1
 
-                self.logger.ok(
-                    f"    strona {page_no}: +{new_count} nowych "
-                    f"(strona={len(page_items)}, lacznie={len(ids)})"
-                )
+                if new_count == 0:
+                    no_new_streak += 1
+                    self.logger.warn(
+                        f"    strona {page_no}: 0 nowych (strona={len(page_items)}, "
+                        f"brak nowych: {no_new_streak}/{MAX_NO_NEW_STREAK})"
+                    )
+                    if no_new_streak >= MAX_NO_NEW_STREAK:
+                        self.logger.warn(
+                            f"    {MAX_NO_NEW_STREAK} stron bez nowych produktow — "
+                            "feed wyczerpany, przechodze do nastepnego"
+                        )
+                        break
+                else:
+                    no_new_streak = 0
+                    self.logger.ok(
+                        f"    strona {page_no}: +{new_count} nowych "
+                        f"(strona={len(page_items)}, lacznie={len(ids)})"
+                    )
 
                 if len(ids) < limit:
                     time.sleep(1.0)
@@ -543,8 +541,6 @@ class AliExpressClient:
             except Exception as e:
                 self.logger.warn(f"    strona {page_no} blad: {e}")
                 break
-
-        return ids[:limit]
 
         return ids[:limit]
 
