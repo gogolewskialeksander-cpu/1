@@ -146,7 +146,14 @@ def parse_args() -> argparse.Namespace:
         "--limit",
         type=int,
         default=None,
-        help="Maksymalna liczba produktow (nadpisuje MAX_PRODUCTS_PER_RUN)",
+        help="Docelowa liczba ZAAKCEPTOWANYCH produktow (nadpisuje MAX_PRODUCTS_PER_RUN)",
+    )
+    parser.add_argument(
+        "--fetch-batch",
+        type=int,
+        default=100,
+        dest="fetch_batch",
+        help="Ile produktow pobierac z AliExpress na runde (domyslnie 100)",
     )
     parser.add_argument(
         "--baselinker",
@@ -170,70 +177,139 @@ def run_pipeline(config: Config, args: argparse.Namespace, logger: Logger) -> in
         Kod wyjscia (0 = sukces, inne = blad).
     """
     # Aplikacja parametrow CLI na config
-    if args.limit is not None:
-        config.max_products_per_run = args.limit
+    target_accepted = args.limit if args.limit is not None else config.max_products_per_run
+    fetch_batch = args.fetch_batch
     if args.country:
         config.ship_from_countries = [args.country.upper()]
 
     logger.ok("Konfiguracja zaladowana")
 
-    # ===== KROK 1: POBIERANIE =====
-    products: List[Product]
+    # ===== TRYB TESTOWY =====
     if config.test_mode:
         logger.ok("Tryb testowy — uzywam mock danych")
         products = get_mock_products()
         logger.ok(f"Zaladowano {len(products)} produktow testowych")
-    else:
-        ae_client = AliExpressClient(
-            app_key=config.aliexpress_app_key,
-            app_secret=config.aliexpress_app_secret,
-            access_token=config.aliexpress_access_token,
-            logger=logger,
+        logger.stats.fetched_from_aliexpress = len(products)
+
+        products = filter_eu_warehouses(products, config.ship_from_countries, logger)
+        products = filter_delivery_time(products, config.max_delivery_days, logger)
+        products = filter_stock_and_rating(
+            products, config.min_stock, config.min_seller_rating, logger
         )
+
+        if not products:
+            logger.warn("Po filtrowaniu nie pozostal zaden produkt.")
+            logger.print_summary()
+            return 0
+
+        analyzer = ClaudeAnalyzer(api_key=config.anthropic_api_key, logger=logger)
+        products = analyzer.analyze_products(products)
+        accepted = filter_by_score(products, config.min_potential_score, logger)
+
+        if not accepted:
+            logger.warn("Claude odrzucil wszystkie produkty.")
+            logger.print_summary()
+            return 0
+
+        try:
+            xml_path = write_xml(
+                products=accepted,
+                output_dir=OUTPUT_DIR,
+                margin_percent=config.margin_target_percent,
+                logger=logger,
+            )
+        except Exception as e:
+            logger.fail(f"Nie udalo sie wygenerowac XML: {e}")
+            logger.print_summary()
+            return 2
+
+        logger.ok(f"GOTOWE: {len(accepted)} produktow gotowych do importu")
+        logger.ok(f"Plik XML: {xml_path}")
+        logger.print_summary()
+        return 0
+
+    # ===== TRYB PRODUKCYJNY: PETLA DO TARGET =====
+    ae_client = AliExpressClient(
+        app_key=config.aliexpress_app_key,
+        app_secret=config.aliexpress_app_secret,
+        access_token=config.aliexpress_access_token,
+        logger=logger,
+    )
+    analyzer = ClaudeAnalyzer(api_key=config.anthropic_api_key, logger=logger)
+
+    all_accepted: List[Product] = []
+    all_seen_ids: set = set()
+    round_num = 0
+    no_new_rounds = 0
+    MAX_EMPTY_ROUNDS = 3
+
+    while len(all_accepted) < target_accepted:
+        if _INTERRUPTED:
+            return 130
+
+        round_num += 1
+        logger.ok(
+            f"Runda {round_num}: pobieranie {fetch_batch} produktow "
+            f"(zaakceptowane: {len(all_accepted)}/{target_accepted})"
+        )
+
         products = ae_client.fetch_products(
             ship_from_countries=config.ship_from_countries,
-            limit=config.max_products_per_run,
+            limit=fetch_batch,
+            exclude_ids=all_seen_ids,
         )
+
         if not products:
-            logger.fail("Nie pobrano zadnych produktow z AliExpress. Przerywam.")
-            return 1
+            no_new_rounds += 1
+            logger.warn(
+                f"Runda {round_num}: brak nowych produktow "
+                f"({no_new_rounds}/{MAX_EMPTY_ROUNDS} pustych rund)"
+            )
+            if no_new_rounds >= MAX_EMPTY_ROUNDS:
+                logger.warn("Wyczerpano zrodla produktow. Przerywam petle.")
+                break
+            continue
 
-    logger.stats.fetched_from_aliexpress = len(products)
+        no_new_rounds = 0
+        all_seen_ids.update(p.product_id for p in products)
+        logger.stats.fetched_from_aliexpress += len(products)
 
-    if _INTERRUPTED:
-        return 130
+        # Filtrowanie
+        products = filter_eu_warehouses(products, config.ship_from_countries, logger)
+        products = filter_delivery_time(products, config.max_delivery_days, logger)
+        products = filter_stock_and_rating(
+            products, config.min_stock, config.min_seller_rating, logger
+        )
 
-    # ===== KROK 2: FILTROWANIE =====
-    products = filter_eu_warehouses(products, config.ship_from_countries, logger)
-    products = filter_delivery_time(products, config.max_delivery_days, logger)
-    products = filter_stock_and_rating(
-        products, config.min_stock, config.min_seller_rating, logger
-    )
+        if not products:
+            logger.warn(f"Runda {round_num}: wszystkie produkty odfiltrowane.")
+            continue
 
-    if not products:
-        logger.warn("Po filtrowaniu nie pozostal zaden produkt.")
-        logger.print_summary()
-        return 0
+        if _INTERRUPTED:
+            return 130
 
-    if _INTERRUPTED:
-        return 130
+        # Analiza Claude
+        products = analyzer.analyze_products(products)
 
-    # ===== KROK 3: ANALIZA CLAUDE =====
-    analyzer = ClaudeAnalyzer(api_key=config.anthropic_api_key, logger=logger)
-    products = analyzer.analyze_products(products)
+        if _INTERRUPTED:
+            return 130
 
-    if _INTERRUPTED:
-        return 130
+        new_accepted = filter_by_score(products, config.min_potential_score, logger)
+        all_accepted.extend(new_accepted)
+        logger.ok(
+            f"Runda {round_num}: +{len(new_accepted)} zaakceptowanych "
+            f"(lacznie {len(all_accepted)}/{target_accepted})"
+        )
 
-    # ===== KROK 4: FILTROWANIE PO OCENIE =====
-    accepted = filter_by_score(products, config.min_potential_score, logger)
+    # Przytnij do dokladnego targetu
+    accepted = all_accepted[:target_accepted]
 
     if not accepted:
-        logger.warn("Claude odrzucil wszystkie produkty.")
+        logger.warn("Nie zaakceptowano zadnego produktu.")
         logger.print_summary()
         return 0
 
-    # ===== KROK 5: GENEROWANIE XML =====
+    # ===== GENEROWANIE XML =====
     try:
         xml_path = write_xml(
             products=accepted,
@@ -246,8 +322,8 @@ def run_pipeline(config: Config, args: argparse.Namespace, logger: Logger) -> in
         logger.print_summary()
         return 2
 
-    # ===== KROK 6: WYSYLKA DO BASELINKER =====
-    if config.test_mode or not args.baselinker:
+    # ===== WYSYLKA DO BASELINKER =====
+    if not args.baselinker:
         logger.ok("Pominieto wysylke do BaseLinker (dodaj --baselinker zeby wyslac)")
     else:
         bl_client = BaseLinkerClient(
@@ -259,7 +335,7 @@ def run_pipeline(config: Config, args: argparse.Namespace, logger: Logger) -> in
         )
         bl_client.upload_products(accepted, FAILED_PRODUCTS_PATH)
 
-    # ===== KROK 7: PODSUMOWANIE =====
+    # ===== PODSUMOWANIE =====
     logger.ok(f"GOTOWE: {len(accepted)} produktow gotowych do importu")
     logger.ok(f"Plik XML: {xml_path}")
     logger.print_summary()
