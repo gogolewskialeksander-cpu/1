@@ -460,7 +460,12 @@ class AliExpressClient:
             self.logger.warn(f"  feed.itemids {feed_name!r} blad: {e}")
         return ids
 
-    def _ids_from_feed(self, feed_name: str, limit: int) -> List[str]:
+    def _ids_from_feed(
+        self,
+        feed_name: str,
+        limit: int,
+        exclude_ids: Optional[set] = None,
+    ) -> List[str]:
         """
         Pobiera product_id z aliexpress.ds.recommend.feed.get z paginacja.
 
@@ -470,7 +475,7 @@ class AliExpressClient:
         - 500 stron ogółem → zabezpieczenie przed infinite loop
         """
         ids: List[str] = []
-        seen: set = set()
+        seen: set = set(exclude_ids) if exclude_ids else set()
         empty_streak: int = 0
         MAX_EMPTY_STREAK: int = 10
         MAX_TOTAL_PAGES: int = 500
@@ -548,38 +553,39 @@ class AliExpressClient:
         ship_from_countries: List[str],
         limit: int,
         keyword: str = "",
+        exclude_ids: Optional[set] = None,
     ) -> List[str]:
         """
         Zwraca product_id do sprawdzenia przez DS API.
 
         Kolejnosc prób:
-        1. aliexpress.ds.text.search — po wielu keywords, 50 ID kazdy
-        2. aliexpress.ds.feedname.get → aliexpress.ds.feed.itemids.get
-        3. aliexpress.ds.feedname.get → aliexpress.ds.recommend.feed.get
-        4. Brak produktow — rzuca AliExpressAPIError z komunikatem
-
-        Nie uzywa zadnych hardkodowanych ID produktow.
+        1. aliexpress.ds.recommend.feed.get (EU Local Stock + kategorie)
+        2. aliexpress.ds.feed.itemids.get
+        3. aliexpress.ds.text.search
+        4. Brak produktow — rzuca AliExpressAPIError
 
         Args:
             ship_from_countries: Lista kodow krajow EU (uzywany pierwszy).
             limit: Maksymalna liczba ID do zwrocenia.
             keyword: Nadpisuje domyslna liste keywords gdy podany.
+            exclude_ids: Zbior ID do pominiecia (juz przetworzone w poprzednich rundach).
         """
+        exclude = set(exclude_ids) if exclude_ids else set()
         ids: List[str] = []
-        seen: set = set()
+        seen: set = set(exclude)
         country = ship_from_countries[0] if ship_from_countries else "PL"
 
         # Krok 1: recommend.feed.get z EU Local Stock + kategoriami
         feed_names = self._get_feed_names()
         self.logger.ok(
             f"Szukam produktow przez aliexpress.ds.recommend.feed.get "
-            f"({len(feed_names)} feedow)..."
+            f"({len(feed_names)} feedow, exclude={len(exclude)} ID)..."
         )
         for feed_name in feed_names:
             if len(ids) >= limit:
                 break
             self.logger.ok(f"  feed: {feed_name!r}...")
-            new_ids = self._ids_from_feed(feed_name, limit)
+            new_ids = self._ids_from_feed(feed_name, limit, exclude_ids=seen)
             new = [pid for pid in new_ids if pid not in seen]
             ids.extend(new)
             seen.update(new)
@@ -637,6 +643,7 @@ class AliExpressClient:
         self,
         ship_from_countries: List[str],
         limit: int,
+        exclude_ids: Optional[set] = None,
     ) -> List[Product]:
         """
         Kompletny workflow pobierania produktow z AliExpress.
@@ -651,7 +658,9 @@ class AliExpressClient:
         """
         self.logger.ok(f"AliExpress: wyszukuje do {limit} produktow z {ship_from_countries}...")
         try:
-            product_ids = self.search_products(ship_from_countries, limit)
+            product_ids = self.search_products(
+                ship_from_countries, limit, exclude_ids=exclude_ids
+            )
         except AliExpressAPIError as e:
             self.logger.fail(f"Nie udalo sie wyszukac produktow: {e}")
             return []
