@@ -76,14 +76,21 @@ Zasady stylu:
 class ClaudeAnalyzer:
     """Wrapper na Anthropic API do analizy produktow w batchach."""
 
-    def __init__(self, api_key: str, logger: Logger) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        logger: Logger,
+        batch_size: Optional[int] = None,
+    ) -> None:
         """
         Args:
             api_key: Klucz API Anthropic.
             logger: Instancja loggera.
+            batch_size: Rozmiar batcha (domyslnie BATCH_SIZE=25).
         """
         self.client = Anthropic(api_key=api_key)
         self.logger = logger
+        self.batch_size: int = batch_size if batch_size is not None else BATCH_SIZE
 
     def analyze_products(self, products: List[Product]) -> List[Product]:
         """
@@ -101,8 +108,8 @@ class ClaudeAnalyzer:
             return []
 
         batches = [
-            products[i : i + BATCH_SIZE]
-            for i in range(0, len(products), BATCH_SIZE)
+            products[i : i + self.batch_size]
+            for i in range(0, len(products), self.batch_size)
         ]
         total_batches = len(batches)
 

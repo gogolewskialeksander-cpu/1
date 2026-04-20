@@ -28,11 +28,7 @@ import sys
 from types import FrameType
 from typing import List, Optional
 
-from aliexpress_client import (
-    AliExpressClient,
-    Product,
-    get_mock_products,
-)
+from aliexpress_client import AliExpressClient, Product
 from baselinker_client import BaseLinkerClient
 from claude_analyzer import ClaudeAnalyzer, filter_by_score
 from config import (
@@ -140,7 +136,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--test",
         action="store_true",
-        help="Tryb testowy z mock danymi (bez wysylki do BaseLinker)",
+        help="Szybki tryb testowy: fetch=20, accept=10, batch Claude=10, bez BaseLinker (~2-3 min)",
     )
     parser.add_argument(
         "--limit",
@@ -177,56 +173,21 @@ def run_pipeline(config: Config, args: argparse.Namespace, logger: Logger) -> in
         Kod wyjscia (0 = sukces, inne = blad).
     """
     # Aplikacja parametrow CLI na config
-    target_accepted = args.limit if args.limit is not None else config.max_products_per_run
-    fetch_batch = args.fetch_batch
+    # --test: szybki run — fetch=20, accept=10, batch Claude=10, bez BaseLinker
+    if args.test:
+        target_accepted = 10
+        fetch_batch = 20
+        claude_batch = 10
+        logger.ok("Tryb --test: fetch=20, accept=10, batch Claude=10, bez BaseLinker")
+    else:
+        target_accepted = args.limit if args.limit is not None else config.max_products_per_run
+        fetch_batch = args.fetch_batch
+        claude_batch = None  # uzyj domyslnego BATCH_SIZE=25
+
     if args.country:
         config.ship_from_countries = [args.country.upper()]
 
     logger.ok("Konfiguracja zaladowana")
-
-    # ===== TRYB TESTOWY =====
-    if config.test_mode:
-        logger.ok("Tryb testowy — uzywam mock danych")
-        products = get_mock_products()
-        logger.ok(f"Zaladowano {len(products)} produktow testowych")
-        logger.stats.fetched_from_aliexpress = len(products)
-
-        products = filter_eu_warehouses(products, config.ship_from_countries, logger)
-        products = filter_delivery_time(products, config.max_delivery_days, logger)
-        products = filter_stock_and_rating(
-            products, config.min_stock, config.min_seller_rating, logger
-        )
-
-        if not products:
-            logger.warn("Po filtrowaniu nie pozostal zaden produkt.")
-            logger.print_summary()
-            return 0
-
-        analyzer = ClaudeAnalyzer(api_key=config.anthropic_api_key, logger=logger)
-        products = analyzer.analyze_products(products)
-        accepted = filter_by_score(products, config.min_potential_score, logger)
-
-        if not accepted:
-            logger.warn("Claude odrzucil wszystkie produkty.")
-            logger.print_summary()
-            return 0
-
-        try:
-            xml_path = write_xml(
-                products=accepted,
-                output_dir=OUTPUT_DIR,
-                margin_percent=config.margin_target_percent,
-                logger=logger,
-            )
-        except Exception as e:
-            logger.fail(f"Nie udalo sie wygenerowac XML: {e}")
-            logger.print_summary()
-            return 2
-
-        logger.ok(f"GOTOWE: {len(accepted)} produktow gotowych do importu")
-        logger.ok(f"Plik XML: {xml_path}")
-        logger.print_summary()
-        return 0
 
     # ===== TRYB PRODUKCYJNY: PETLA DO TARGET =====
     ae_client = AliExpressClient(
@@ -235,7 +196,11 @@ def run_pipeline(config: Config, args: argparse.Namespace, logger: Logger) -> in
         access_token=config.aliexpress_access_token,
         logger=logger,
     )
-    analyzer = ClaudeAnalyzer(api_key=config.anthropic_api_key, logger=logger)
+    analyzer = ClaudeAnalyzer(
+        api_key=config.anthropic_api_key,
+        logger=logger,
+        batch_size=claude_batch,
+    )
 
     all_accepted: List[Product] = []
     all_seen_ids: set = set()
@@ -323,7 +288,9 @@ def run_pipeline(config: Config, args: argparse.Namespace, logger: Logger) -> in
         return 2
 
     # ===== WYSYLKA DO BASELINKER =====
-    if not args.baselinker:
+    if args.test:
+        logger.ok("Tryb --test: pomijam wysylke do BaseLinker")
+    elif not args.baselinker:
         logger.ok("Pominieto wysylke do BaseLinker (dodaj --baselinker zeby wyslac)")
     else:
         bl_client = BaseLinkerClient(

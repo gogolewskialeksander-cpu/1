@@ -62,8 +62,9 @@ class Config:
         """
         Waliduje obecnosc wymaganych kluczy API.
 
-        W trybie testowym wymagany jest tylko klucz Claude.
-        W trybie produkcyjnym wymagane sa wszystkie klucze.
+        Zarowno --test jak i tryb normalny chodza po realnych feedach AliExpress
+        (rozniaca sie tylko limitami), wiec wymagamy wszystkich kluczy.
+        BASELINKER_API_TOKEN wymagany tylko gdy user wywola --baselinker.
 
         Raises:
             ConfigError: Gdy brakuje wymaganych wartosci.
@@ -72,16 +73,12 @@ class Config:
 
         if not self.anthropic_api_key:
             missing.append("ANTHROPIC_API_KEY")
-
-        if not self.test_mode:
-            if not self.aliexpress_app_key:
-                missing.append("ALIEXPRESS_APP_KEY")
-            if not self.aliexpress_app_secret:
-                missing.append("ALIEXPRESS_APP_SECRET")
-            if not self.aliexpress_access_token:
-                missing.append("ALIEXPRESS_ACCESS_TOKEN")
-            if not self.baselinker_api_token:
-                missing.append("BASELINKER_API_TOKEN")
+        if not self.aliexpress_app_key:
+            missing.append("ALIEXPRESS_APP_KEY")
+        if not self.aliexpress_app_secret:
+            missing.append("ALIEXPRESS_APP_SECRET")
+        if not self.aliexpress_access_token:
+            missing.append("ALIEXPRESS_ACCESS_TOKEN")
 
         if missing:
             raise ConfigError(
