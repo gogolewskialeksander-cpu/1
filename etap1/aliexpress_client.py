@@ -32,18 +32,84 @@ DAILY_REQUEST_LIMIT: int = 1000
 REQUEST_TIMEOUT_SECONDS: int = 30
 
 # Rzeczywiste feed names z aliexpress.ds.feedname.get
+# AEB_ = Local+ (magazyny EU, szybka dostawa), DS_ = globalne bestsellery
 DS_FEED_NAMES: List[str] = [
+    # === AEB Local+ per kraj (najszybsza dostawa do PL) ===
     "AEB_Poland_LocalStock_PlatformOperation_20241028",   # PL ~199k
-    "AEB_Droplo_BestsellersItems_20241016",               # ~201k
-    "AEB_EAN Items",                                       # ~198k
     "AEB_DE_LocalStock_PlatformOperation_20241023",       # DE ~1710
     "AEB_ES_LocalStock_PlatformOperation_20240926",       # ES ~2220
     "AEB_FR_LocalStock_PlatformOperation_20240926",       # FR ~2160
+    "AEB_Italy_LocalStock_PlatformOperation",             # IT
+    "AEB_IT_LocalStock_PlatformOperation",                # IT (alt)
+    "AEB_CZ_LocalStock_PlatformOperation",                # CZ
+    "AEB_NL_LocalStock_PlatformOperation",                # NL
+    "AEB_BE_LocalStock_PlatformOperation",                # BE
+    "AEB_PT_LocalStock_PlatformOperation",                # PT
+    "AEB_AT_LocalStock_PlatformOperation",                # AT
+    "AEB_SE_LocalStock_PlatformOperation",                # SE
+    # === AEB generyczne (mix EU local+) ===
+    "AEB_Droplo_BestsellersItems_20241016",               # ~201k
+    "AEB_EAN Items",                                       # ~198k
+    # === DS globalne bestsellery (najnizszy priorytet — moga miec magazyn CN) ===
     "DS_Sports&Outdoors_bestsellers",                     # ~27k
     "DS_Automobile&Accessories_bestsellers",              # ~21k
     "DS_ConsumerElectronics_bestsellers",                 # ~20k
     "DS_Home&Kitchen_bestsellers",                        # ~13k
 ]
+
+# Mapa feed → implicit kraj wysylki. None = feed mieszany, wymaga product.get.
+# Pozwala filtrowac feedy PRZED iteracja ID (oszczednosc limitu API).
+FEED_COUNTRY_HINT: Dict[str, Optional[str]] = {
+    "AEB_Poland_LocalStock_PlatformOperation_20241028": "PL",
+    "AEB_DE_LocalStock_PlatformOperation_20241023": "DE",
+    "AEB_ES_LocalStock_PlatformOperation_20240926": "ES",
+    "AEB_FR_LocalStock_PlatformOperation_20240926": "FR",
+    "AEB_Italy_LocalStock_PlatformOperation": "IT",
+    "AEB_IT_LocalStock_PlatformOperation": "IT",
+    "AEB_CZ_LocalStock_PlatformOperation": "CZ",
+    "AEB_NL_LocalStock_PlatformOperation": "NL",
+    "AEB_BE_LocalStock_PlatformOperation": "BE",
+    "AEB_PT_LocalStock_PlatformOperation": "PT",
+    "AEB_AT_LocalStock_PlatformOperation": "AT",
+    "AEB_SE_LocalStock_PlatformOperation": "SE",
+}
+
+
+def _country_hint_for_feed(feed_name: str) -> Optional[str]:
+    """Zgaduje kraj wysylki z nazwy feedu. None = feed mieszany."""
+    if feed_name in FEED_COUNTRY_HINT:
+        return FEED_COUNTRY_HINT[feed_name]
+    lname = feed_name.lower()
+    # Heurystyka dla dynamicznie pobranych feedow z feedname.get
+    if "localstock" in lname or "local_stock" in lname:
+        for code, keywords in [
+            ("PL", ["poland", "_pl_", "polska"]),
+            ("DE", ["germany", "_de_", "deutschland"]),
+            ("ES", ["spain", "_es_", "españa", "espana"]),
+            ("FR", ["france", "_fr_"]),
+            ("IT", ["italy", "_it_", "italia"]),
+            ("CZ", ["czech", "_cz_"]),
+            ("NL", ["netherlands", "_nl_", "holland"]),
+            ("BE", ["belgium", "_be_"]),
+            ("PT", ["portugal", "_pt_"]),
+            ("AT", ["austria", "_at_"]),
+            ("SE", ["sweden", "_se_"]),
+        ]:
+            if any(k in lname for k in keywords):
+                return code
+    return None
+
+
+def _sort_feeds_aeb_first(feeds: List[str]) -> List[str]:
+    """Sortuje feedy: AEB_ (Local+) najpierw, potem DS_ globalne, reszta na koncu."""
+    def priority(name: str) -> int:
+        if name.startswith("AEB_"):
+            return 0
+        if name.startswith("DS_"):
+            return 2
+        return 1
+    return sorted(feeds, key=priority)
+
 
 FEED_PAGE_SIZE: int = 50
 FEED_MAX_PAGES: int = 20   # max 20 × 50 = 1000 ID per feed
@@ -490,6 +556,8 @@ class AliExpressClient:
                     {
                         "feed_name": feed_name,
                         "country": "PL",
+                        "ship_to_country": "PL",
+                        "local_plus": "true",
                         "target_currency": "PLN",
                         "target_language": "PL",
                         "page_no": str(page_no),
@@ -571,9 +639,31 @@ class AliExpressClient:
         ids: List[str] = []
         seen: set = set(exclude)
         country = ship_from_countries[0] if ship_from_countries else "PL"
+        allowed_set = {c.upper() for c in ship_from_countries} if ship_from_countries else set()
 
         # Krok 1: recommend.feed.get z EU Local Stock + kategoriami
-        feed_names = self._get_feed_names()
+        # Priorytet: AEB_ (Local+) → DS_ (globalne)
+        feed_names = _sort_feeds_aeb_first(self._get_feed_names())
+
+        # Filtruj feedy ktore wiemy ze nie pasuja do allowed_countries
+        # (np. AEB_DE_LocalStock pominiety gdy user chce tylko PL).
+        # Feedy mieszane (hint=None) zawsze trafiaja do petli.
+        if allowed_set:
+            usable_feeds: List[str] = []
+            skipped: List[str] = []
+            for fn in feed_names:
+                hint = _country_hint_for_feed(fn)
+                if hint is None or hint in allowed_set:
+                    usable_feeds.append(fn)
+                else:
+                    skipped.append(f"{fn}→{hint}")
+            if skipped:
+                self.logger.ok(
+                    f"  Pomijam {len(skipped)} feedow (kraj poza allowed): "
+                    f"{', '.join(skipped[:5])}{'...' if len(skipped) > 5 else ''}"
+                )
+            feed_names = usable_feeds
+
         self.logger.ok(
             f"Szukam produktow przez aliexpress.ds.recommend.feed.get "
             f"({len(feed_names)} feedow, exclude={len(exclude)} ID)..."
@@ -581,7 +671,9 @@ class AliExpressClient:
         for feed_name in feed_names:
             if len(ids) >= limit:
                 break
-            self.logger.ok(f"  feed: {feed_name!r}...")
+            hint = _country_hint_for_feed(feed_name)
+            tag = f"[Local+ {hint}]" if hint else "[mix]"
+            self.logger.ok(f"  feed {tag}: {feed_name!r}...")
             new_ids = self._ids_from_feed(feed_name, limit, exclude_ids=seen)
             new = [pid for pid in new_ids if pid not in seen]
             ids.extend(new)
@@ -593,12 +685,14 @@ class AliExpressClient:
             self.logger.ok(f"recommend.feed: {len(result)} product_id do sprawdzenia")
             return result
 
-        # Krok 2: feed.itemids.get (lzejszy endpoint)
+        # Krok 2: feed.itemids.get (lzejszy endpoint, ta sama lista feedow z hintami)
         self.logger.warn("recommend.feed puste — proba feed.itemids.get...")
         for feed_name in feed_names:
             if len(ids) >= limit:
                 break
-            self.logger.ok(f"  feed.itemids: {feed_name!r}...")
+            hint = _country_hint_for_feed(feed_name)
+            tag = f"[Local+ {hint}]" if hint else "[mix]"
+            self.logger.ok(f"  feed.itemids {tag}: {feed_name!r}...")
             new_ids = self._ids_from_feed_itemids(feed_name, limit)
             new = [pid for pid in new_ids if pid not in seen]
             ids.extend(new)
