@@ -1,0 +1,1339 @@
+"""
+Klient AliExpress Dropshipping API.
+
+Obsluguje:
+- podpisywanie requestow HMAC-SHA256
+- rate limiting (max 1000 req/dzien)
+- retry z exponential backoff
+- pobieranie produktow (aliexpress.ds.product.get)
+- sprawdzanie dostawy (aliexpress.ds.shipping.info.query)
+- filtrowanie po europejskich magazynach
+
+Dodatkowo udostepnia funkcje get_mock_products() do trybu testowego.
+"""
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+import requests
+
+from logger import Logger
+
+
+API_URL: str = "https://api-sg.aliexpress.com/rest"
+SIGN_METHOD: str = "sha256"
+PARTNER_ID: str = "iop-sdk-python-20220609"
+DAILY_REQUEST_LIMIT: int = 1000
+REQUEST_TIMEOUT_SECONDS: int = 30
+
+# Rzeczywiste feed names z aliexpress.ds.feedname.get
+# AEB_ = Local+ (magazyny EU, szybka dostawa), DS_ = globalne bestsellery
+DS_FEED_NAMES: List[str] = [
+    # === AEB Local+ per kraj (najszybsza dostawa do PL) ===
+    "AEB_Poland_LocalStock_PlatformOperation_20241028",   # PL ~199k
+    "AEB_DE_LocalStock_PlatformOperation_20241023",       # DE ~1710
+    "AEB_ES_LocalStock_PlatformOperation_20240926",       # ES ~2220
+    "AEB_FR_LocalStock_PlatformOperation_20240926",       # FR ~2160
+    "AEB_Italy_LocalStock_PlatformOperation",             # IT
+    "AEB_IT_LocalStock_PlatformOperation",                # IT (alt)
+    "AEB_CZ_LocalStock_PlatformOperation",                # CZ
+    "AEB_NL_LocalStock_PlatformOperation",                # NL
+    "AEB_BE_LocalStock_PlatformOperation",                # BE
+    "AEB_PT_LocalStock_PlatformOperation",                # PT
+    "AEB_AT_LocalStock_PlatformOperation",                # AT
+    "AEB_SE_LocalStock_PlatformOperation",                # SE
+    # === AEB generyczne (mix EU local+) ===
+    "AEB_Droplo_BestsellersItems_20241016",               # ~201k
+    "AEB_EAN Items",                                       # ~198k
+    # === DS globalne bestsellery (najnizszy priorytet — moga miec magazyn CN) ===
+    "DS_Sports&Outdoors_bestsellers",                     # ~27k
+    "DS_Automobile&Accessories_bestsellers",              # ~21k
+    "DS_ConsumerElectronics_bestsellers",                 # ~20k
+    "DS_Home&Kitchen_bestsellers",                        # ~13k
+]
+
+# Mapa feed → implicit kraj wysylki. None = feed mieszany, wymaga product.get.
+# Pozwala filtrowac feedy PRZED iteracja ID (oszczednosc limitu API).
+FEED_COUNTRY_HINT: Dict[str, Optional[str]] = {
+    "AEB_Poland_LocalStock_PlatformOperation_20241028": "PL",
+    "AEB_DE_LocalStock_PlatformOperation_20241023": "DE",
+    "AEB_ES_LocalStock_PlatformOperation_20240926": "ES",
+    "AEB_FR_LocalStock_PlatformOperation_20240926": "FR",
+    "AEB_Italy_LocalStock_PlatformOperation": "IT",
+    "AEB_IT_LocalStock_PlatformOperation": "IT",
+    "AEB_CZ_LocalStock_PlatformOperation": "CZ",
+    "AEB_NL_LocalStock_PlatformOperation": "NL",
+    "AEB_BE_LocalStock_PlatformOperation": "BE",
+    "AEB_PT_LocalStock_PlatformOperation": "PT",
+    "AEB_AT_LocalStock_PlatformOperation": "AT",
+    "AEB_SE_LocalStock_PlatformOperation": "SE",
+}
+
+
+def _country_hint_for_feed(feed_name: str) -> Optional[str]:
+    """Zgaduje kraj wysylki z nazwy feedu. None = feed mieszany."""
+    if feed_name in FEED_COUNTRY_HINT:
+        return FEED_COUNTRY_HINT[feed_name]
+    lname = feed_name.lower()
+    # Heurystyka dla dynamicznie pobranych feedow z feedname.get
+    if "localstock" in lname or "local_stock" in lname:
+        for code, keywords in [
+            ("PL", ["poland", "_pl_", "polska"]),
+            ("DE", ["germany", "_de_", "deutschland"]),
+            ("ES", ["spain", "_es_", "españa", "espana"]),
+            ("FR", ["france", "_fr_"]),
+            ("IT", ["italy", "_it_", "italia"]),
+            ("CZ", ["czech", "_cz_"]),
+            ("NL", ["netherlands", "_nl_", "holland"]),
+            ("BE", ["belgium", "_be_"]),
+            ("PT", ["portugal", "_pt_"]),
+            ("AT", ["austria", "_at_"]),
+            ("SE", ["sweden", "_se_"]),
+        ]:
+            if any(k in lname for k in keywords):
+                return code
+    return None
+
+
+def _sort_feeds_aeb_first(feeds: List[str]) -> List[str]:
+    """Sortuje feedy: AEB_ (Local+) najpierw, potem DS_ globalne, reszta na koncu."""
+    def priority(name: str) -> int:
+        if name.startswith("AEB_"):
+            return 0
+        if name.startswith("DS_"):
+            return 2
+        return 1
+    return sorted(feeds, key=priority)
+
+
+FEED_PAGE_SIZE: int = 50
+FEED_MAX_PAGES: int = 20   # max 20 × 50 = 1000 ID per feed
+
+# Slowa kluczowe do text.search — fallback gdy feedy puste
+DS_SEARCH_KEYWORDS: List[str] = [
+    "phone holder",
+    "led strip",
+    "smartwatch",
+    "camping chair",
+    "power bank",
+    "bluetooth speaker",
+    "kitchen gadget",
+    "car accessories",
+]
+
+
+@dataclass
+class Product:
+    """
+    Pojedynczy produkt z AliExpress — znormalizowana forma.
+
+    Uzywane w calym pipeline. Pole `claude_*` jest wypelniane pozniej przez
+    ClaudeAnalyzer; poczatkowo pozostaje puste.
+    """
+
+    product_id: str
+    title: str
+    description: str
+    images: List[str]
+    price: float                    # cena zakupu (hurtowa) w PLN
+    price_original: float           # cena oryginalna z AliExpress
+    currency: str
+    sku: str
+    stock: int
+    seller_id: str
+    seller_rating: float
+    ship_from_country: str
+    estimated_delivery_days: int
+    variants: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Wymiary i waga opakowania
+    weight_kg: float = 0.0
+    length_cm: float = 0.0
+    width_cm: float = 0.0
+    height_cm: float = 0.0
+
+    # Pola wypelniane przez Claude
+    claude_title_pl: str = ""
+    claude_description_pl: str = ""
+    claude_long_description: str = ""
+    claude_category: str = ""
+    claude_potential_score: int = 0
+    claude_reject_reason: str = ""
+
+    def compute_sale_price(self, margin_percent: float) -> float:
+        """Oblicza cene sprzedazy detalicznej z podana marza (w procentach)."""
+        return round(self.price * (1 + margin_percent / 100.0), 2)
+
+
+class AliExpressAPIError(RuntimeError):
+    """Blad komunikacji z AliExpress API."""
+
+
+class AliExpressClient:
+    """Klient oficjalnego AliExpress Dropshipping API."""
+
+    def __init__(
+        self,
+        app_key: str,
+        app_secret: str,
+        access_token: str,
+        logger: Logger,
+    ) -> None:
+        """
+        Args:
+            app_key: Klucz aplikacji z panelu AliExpress Open Platform.
+            app_secret: Sekret aplikacji.
+            access_token: Token sesji uzytkownika (OAuth).
+            logger: Instancja loggera.
+        """
+        self.app_key = app_key
+        self.app_secret = app_secret
+        self.access_token = access_token
+        self.logger = logger
+        self._session = requests.Session()
+        self._request_count: int = 0
+
+    def _build_signature(self, method: str, params: Dict[str, str]) -> str:
+        """
+        Oblicza HMAC-SHA256 zgodnie z oficjalnym IOP SDK AliExpress.
+
+        Format bazowy: method + klucz1wartosc1klucz2wartosc2...
+        (params posortowane alfabetycznie, bez pola 'sign')
+        Klucz HMAC = app_secret
+        """
+        sorted_items = sorted((k, v) for k, v in params.items() if k != "sign")
+        base_string = method + "".join(f"{k}{v}" for k, v in sorted_items)
+        signature = hmac.new(
+            key=self.app_secret.encode("utf-8"),
+            msg=base_string.encode("utf-8"),
+            digestmod=hashlib.sha256,
+        ).hexdigest().upper()
+        return signature
+
+    @staticmethod
+    def _parse_ban_seconds(msg: str) -> int:
+        """Wyciaga liczbe sekund z 'This ban will last X seconds'."""
+        import re as _re
+        m = _re.search(r"last\s+(\d+)\s+second", msg, _re.IGNORECASE)
+        return int(m.group(1)) if m else 60  # domyslnie 60s jesli nie znaleziono
+
+    def _call(
+        self,
+        method: str,
+        method_params: Dict[str, Any],
+        max_retries: int = 3,
+    ) -> Dict[str, Any]:
+        """
+        Wykonuje pojedyncze zapytanie do AliExpress z retry i podpisem.
+
+        Args:
+            method: Nazwa metody API (np. 'aliexpress.ds.product.get').
+            method_params: Parametry specyficzne dla metody.
+            max_retries: Liczba prob w razie bledu sieciowego.
+
+        Raises:
+            AliExpressAPIError: Gdy limit dzienny przekroczony lub wszystkie proby
+                zakoncza sie bledem.
+        """
+        if self._request_count >= DAILY_REQUEST_LIMIT:
+            raise AliExpressAPIError(
+                f"Osiagnieto dzienny limit {DAILY_REQUEST_LIMIT} requestow do AliExpress."
+            )
+
+        # Parametry systemowe — format IOP SDK (partner_id, sec+'000' timestamp)
+        params: Dict[str, str] = {
+            "app_key": self.app_key,
+            "sign_method": SIGN_METHOD,
+            "timestamp": str(int(round(time.time()))) + "000",
+            "partner_id": PARTNER_ID,
+            "method": method,
+            "simplify": "false",
+            "format": "json",
+            "access_token": self.access_token,
+        }
+        # Dokladamy parametry metody (zawsze jako string do podpisu)
+        for key, value in method_params.items():
+            if isinstance(value, (dict, list)):
+                params[key] = json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+            else:
+                params[key] = str(value)
+
+        params["sign"] = self._build_signature(method, params)
+
+        backoff_seconds: float = 2.0
+        last_error: Optional[Exception] = None
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                self._request_count += 1
+                response = self._session.post(
+                    API_URL,
+                    data=params,
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+                response.raise_for_status()
+                data = response.json()
+                if isinstance(data, dict) and "error_response" in data:
+                    err = data["error_response"]
+                    msg = err.get("msg", "") or err.get("sub_msg", "") or "unknown"
+                    code = err.get("code", "?")
+
+                    # AppApiCallLimit — wyciagnij czas bana i poczekaj
+                    if "AppApiCallLimit" in msg or "AppApiCallLimit" in str(code):
+                        ban_seconds = self._parse_ban_seconds(msg)
+                        wait = ban_seconds + 2
+                        self.logger.warn(
+                            f"Rate limit (AppApiCallLimit): ban {ban_seconds}s. "
+                            f"Czekam {wait}s przed ponowieniem..."
+                        )
+                        time.sleep(wait)
+                        backoff_seconds = 2.0  # reset — nie podwajaj po rate limit
+                        continue
+
+                    raise AliExpressAPIError(
+                        f"AliExpress API error: {msg} (code={code})"
+                    )
+                return data
+            except (requests.RequestException, AliExpressAPIError, ValueError) as e:
+                last_error = e
+                if attempt < max_retries:
+                    self.logger.warn(
+                        f"AliExpress API blad (proba {attempt}/{max_retries}): {e}. "
+                        f"Ponawiam za {backoff_seconds:.0f}s..."
+                    )
+                    time.sleep(backoff_seconds)
+                    backoff_seconds *= 2
+                else:
+                    self.logger.fail(
+                        f"AliExpress API — wszystkie proby nieudane: {e}"
+                    )
+
+        raise AliExpressAPIError(f"AliExpress API nieosiagalne: {last_error}")
+
+    def get_product(self, product_id: str, language: str = "pl", country: str = "PL") -> Dict[str, Any]:
+        """
+        Pobiera szczegoly produktu przez aliexpress.ds.product.get.
+
+        Args:
+            product_id: Identyfikator produktu na AliExpress.
+            language: Kod jezyka (np. 'pl', 'en').
+            country: Kod kraju docelowego.
+
+        Returns:
+            Surowa odpowiedz API jako dict.
+        """
+        return self._call(
+            "aliexpress.ds.product.get",
+            {
+                "product_id": product_id,
+                "ship_to_country": country,
+                "target_currency": "PLN",
+                "target_language": language.upper(),
+            },
+        )
+
+    def query_shipping(
+        self,
+        product_id: str,
+        country: str = "PL",
+        quantity: int = 1,
+    ) -> Dict[str, Any]:
+        """
+        Pobiera informacje o dostawie dla produktu przez
+        aliexpress.ds.shipping.info.query.
+        """
+        return self._call(
+            "aliexpress.ds.shipping.info.query",
+            {
+                "product_id": product_id,
+                "country_code": country,
+                "product_num": quantity,
+            },
+        )
+
+    def _diagnose_endpoints(self) -> None:
+        """
+        Diagnostyka: wywoluje dwa nowe endpointy i drukuje pelne odpowiedzi JSON.
+
+        1. aliexpress.ds.feedname.get          — bez parametrow biznesowych
+        2. /ds/recommend/feed/get (REST slash)  — inny niz aliexpress.ds.recommend.feed.get;
+           base_string podpisu zaczyna sie od "/ds/recommend/feed/get"
+        """
+        separator = "=" * 60
+
+        # ── 1. aliexpress.ds.feedname.get ────────────────────────────
+        self.logger.ok(f"\n{separator}")
+        self.logger.ok("DIAGNOZA #1: aliexpress.ds.feedname.get")
+        self.logger.ok(separator)
+        try:
+            resp1 = self._call("aliexpress.ds.feedname.get", {})
+            self.logger.ok(json.dumps(resp1, indent=2, ensure_ascii=False))
+        except Exception as e:
+            self.logger.warn(f"BLAD: {e}")
+
+        # ── 2. /ds/recommend/feed/get (REST slash-path) ───────────────
+        self.logger.ok(f"\n{separator}")
+        self.logger.ok("DIAGNOZA #2: /ds/recommend/feed/get  (REST slash-path)")
+        self.logger.ok(separator)
+        try:
+            resp2 = self._call(
+                "/ds/recommend/feed/get",
+                {
+                    "country": "PL",
+                    "target_currency": "PLN",
+                    "target_language": "PL",
+                    "page_size": "20",
+                    "page_no": "1",
+                    "feed_name": "DS_bestseller_en",
+                },
+            )
+            self.logger.ok(json.dumps(resp2, indent=2, ensure_ascii=False))
+        except Exception as e:
+            self.logger.warn(f"BLAD: {e}")
+
+        self.logger.ok(separator + "\n")
+
+    def _get_feed_names(self) -> List[str]:
+        """
+        Pobiera dostepne nazwy feedow przez aliexpress.ds.feedname.get.
+
+        Zwraca DS_FEED_NAMES_FALLBACK jesli endpoint niedostepny lub pusty.
+        """
+        try:
+            data = self._call("aliexpress.ds.feedname.get", {})
+            root = data.get("aliexpress_ds_feedname_get_response", {}) or data
+            result = root.get("result", root) if isinstance(root, dict) else {}
+
+            raw = result.get("feed_names") if isinstance(result, dict) else None
+            if isinstance(raw, list) and raw:
+                names = [str(n).strip() for n in raw if n]
+                self.logger.ok(f"  feedname.get: {names}")
+                return names
+            # Moze byc string rozdzielony przecinkami
+            if isinstance(raw, str) and raw.strip():
+                names = [n.strip() for n in raw.split(",") if n.strip()]
+                self.logger.ok(f"  feedname.get (str): {names}")
+                return names
+        except Exception as e:
+            self.logger.warn(f"  feedname.get blad: {e}")
+
+        self.logger.warn(
+            f"  feedname.get niedostepny — uzyje domyslnych: {DS_FEED_NAMES}"
+        )
+        return DS_FEED_NAMES
+
+    def _ids_from_text_search(
+        self,
+        keyword: str,
+        country: str,
+        page_size: int = 50,
+    ) -> List[str]:
+        """
+        Wyszukuje product_id przez aliexpress.ds.text.search.
+
+        Parametry camelCase zgodnie ze specyfikacja API.
+        Zwraca [] jesli blad lub brak wynikow.
+        """
+        ids: List[str] = []
+        try:
+            data = self._call(
+                "aliexpress.ds.text.search",
+                {
+                    "keyWord": keyword,
+                    "countryCode": country,
+                    "currency": "PLN",
+                    "local": country,
+                    "pageSize": str(page_size),
+                    "pageIndex": "1",
+                    "sortBy": "orders,desc",
+                },
+            )
+            root = data.get("aliexpress_ds_text_search_response", {}) or data
+            result = root.get("result", root) if isinstance(root, dict) else {}
+
+            # Produkty moga byc pod rozymi kluczami
+            raw = None
+            if isinstance(result, dict):
+                raw = (
+                    result.get("products")
+                    or result.get("product_list")
+                    or result.get("data")
+                    or []
+                )
+            if isinstance(raw, dict):
+                raw = raw.get("product", raw.get("products", raw.get("item", [])))
+            if not isinstance(raw, list):
+                raw = []
+
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                pid = str(
+                    item.get("product_id")
+                    or item.get("productId")
+                    or item.get("item_id")
+                    or ""
+                ).strip()
+                if pid and pid not in ids:
+                    ids.append(pid)
+
+        except Exception as e:
+            self.logger.warn(f"  text.search {keyword!r} blad: {e}")
+        return ids
+
+    def _ids_from_feed_itemids(self, feed_name: str, limit: int) -> List[str]:
+        """
+        Pobiera product_id przez aliexpress.ds.feed.itemids.get.
+
+        Lzejszy endpoint — zwraca tylko ID bez pelnych danych produktu.
+        Zwraca [] jesli feed pusty lub metoda niedostepna.
+        """
+        ids: List[str] = []
+        try:
+            data = self._call(
+                "aliexpress.ds.feed.itemids.get",
+                {
+                    "feed_name": feed_name,
+                    "page_size": str(min(limit, 50)),
+                    "page_no": "1",
+                },
+            )
+            root = data.get("aliexpress_ds_feed_itemids_get_response", {}) or data
+            result = root.get("result", root) if isinstance(root, dict) else {}
+
+            # product_ids moze byc lista stringow lub lista dict
+            raw = result.get("product_ids") if isinstance(result, dict) else None
+            if isinstance(raw, list):
+                for item in raw:
+                    if isinstance(item, dict):
+                        pid = str(item.get("product_id", "")).strip()
+                    else:
+                        pid = str(item).strip()
+                    if pid and pid not in ids:
+                        ids.append(pid)
+            elif isinstance(raw, str) and raw:
+                # Moze byc przecinkowa lista
+                for pid in raw.split(","):
+                    pid = pid.strip()
+                    if pid and pid not in ids:
+                        ids.append(pid)
+
+        except Exception as e:
+            self.logger.warn(f"  feed.itemids {feed_name!r} blad: {e}")
+        return ids
+
+    def _ids_from_feed(
+        self,
+        feed_name: str,
+        limit: int,
+        exclude_ids: Optional[set] = None,
+    ) -> List[str]:
+        """
+        Pobiera product_id z aliexpress.ds.recommend.feed.get z paginacja.
+
+        Zatrzymuje sie gdy:
+        - zebrano wymagana liczbe ID (limit)
+        - 20 kolejnych stron bez nowych produktow → feed wyczerpany, przejdź do następnego
+        - 500 stron ogółem → zabezpieczenie przed infinite loop
+        """
+        ids: List[str] = []
+        seen: set = set(exclude_ids) if exclude_ids else set()
+        no_new_streak: int = 0
+        MAX_NO_NEW_STREAK: int = 20
+        MAX_TOTAL_PAGES: int = 500
+        page_no: int = 0
+
+        while len(ids) < limit and page_no < MAX_TOTAL_PAGES:
+            page_no += 1
+            try:
+                data = self._call(
+                    "aliexpress.ds.recommend.feed.get",
+                    {
+                        "feed_name": feed_name,
+                        "country": "PL",
+                        "ship_to_country": "PL",
+                        "local_plus": "true",
+                        "target_currency": "PLN",
+                        "target_language": "PL",
+                        "page_no": str(page_no),
+                        "page_size": str(FEED_PAGE_SIZE),
+                    },
+                )
+                root = data.get("aliexpress_ds_recommend_feed_get_response", {}) or data
+                result = root.get("result", root) if isinstance(root, dict) else {}
+
+                raw = result.get("products") if isinstance(result, dict) else None
+                if isinstance(raw, list):
+                    page_items = raw
+                elif isinstance(raw, dict):
+                    page_items = raw.get("product", [])
+                else:
+                    page_items = []
+
+                new_count = 0
+                for item in page_items:
+                    if not isinstance(item, dict):
+                        continue
+                    pid = str(item.get("product_id", item.get("productId", ""))).strip()
+                    if pid and pid not in seen:
+                        seen.add(pid)
+                        ids.append(pid)
+                        new_count += 1
+
+                if new_count == 0:
+                    no_new_streak += 1
+                    self.logger.warn(
+                        f"    strona {page_no}: 0 nowych (strona={len(page_items)}, "
+                        f"brak nowych: {no_new_streak}/{MAX_NO_NEW_STREAK})"
+                    )
+                    if no_new_streak >= MAX_NO_NEW_STREAK:
+                        self.logger.warn(
+                            f"    {MAX_NO_NEW_STREAK} stron bez nowych produktow — "
+                            "feed wyczerpany, przechodze do nastepnego"
+                        )
+                        break
+                else:
+                    no_new_streak = 0
+                    self.logger.ok(
+                        f"    strona {page_no}: +{new_count} nowych "
+                        f"(strona={len(page_items)}, lacznie={len(ids)})"
+                    )
+
+                if len(ids) < limit:
+                    time.sleep(1.0)
+
+            except Exception as e:
+                self.logger.warn(f"    strona {page_no} blad: {e}")
+                break
+
+        return ids[:limit]
+
+    def search_products(
+        self,
+        ship_from_countries: List[str],
+        limit: int,
+        keyword: str = "",
+        exclude_ids: Optional[set] = None,
+    ) -> List[str]:
+        """
+        Zwraca product_id do sprawdzenia przez DS API.
+
+        Kolejnosc prób:
+        1. aliexpress.ds.recommend.feed.get (EU Local Stock + kategorie)
+        2. aliexpress.ds.feed.itemids.get
+        3. aliexpress.ds.text.search
+        4. Brak produktow — rzuca AliExpressAPIError
+
+        Args:
+            ship_from_countries: Lista kodow krajow EU (uzywany pierwszy).
+            limit: Maksymalna liczba ID do zwrocenia.
+            keyword: Nadpisuje domyslna liste keywords gdy podany.
+            exclude_ids: Zbior ID do pominiecia (juz przetworzone w poprzednich rundach).
+        """
+        exclude = set(exclude_ids) if exclude_ids else set()
+        ids: List[str] = []
+        seen: set = set(exclude)
+        country = ship_from_countries[0] if ship_from_countries else "PL"
+        allowed_set = {c.upper() for c in ship_from_countries} if ship_from_countries else set()
+
+        # Krok 1: recommend.feed.get z EU Local Stock + kategoriami
+        # Priorytet: AEB_ (Local+) → DS_ (globalne)
+        feed_names = _sort_feeds_aeb_first(self._get_feed_names())
+
+        # Filtruj feedy ktore wiemy ze nie pasuja do allowed_countries
+        # (np. AEB_DE_LocalStock pominiety gdy user chce tylko PL).
+        # Feedy mieszane (hint=None) zawsze trafiaja do petli.
+        if allowed_set:
+            usable_feeds: List[str] = []
+            skipped: List[str] = []
+            for fn in feed_names:
+                hint = _country_hint_for_feed(fn)
+                if hint is None or hint in allowed_set:
+                    usable_feeds.append(fn)
+                else:
+                    skipped.append(f"{fn}→{hint}")
+            if skipped:
+                self.logger.ok(
+                    f"  Pomijam {len(skipped)} feedow (kraj poza allowed): "
+                    f"{', '.join(skipped[:5])}{'...' if len(skipped) > 5 else ''}"
+                )
+            feed_names = usable_feeds
+
+        self.logger.ok(
+            f"Szukam produktow przez aliexpress.ds.recommend.feed.get "
+            f"({len(feed_names)} feedow, exclude={len(exclude)} ID)..."
+        )
+        for feed_name in feed_names:
+            if len(ids) >= limit:
+                break
+            hint = _country_hint_for_feed(feed_name)
+            tag = f"[Local+ {hint}]" if hint else "[mix]"
+            self.logger.ok(f"  feed {tag}: {feed_name!r}...")
+            new_ids = self._ids_from_feed(feed_name, limit, exclude_ids=seen)
+            new = [pid for pid in new_ids if pid not in seen]
+            ids.extend(new)
+            seen.update(new)
+            self.logger.ok(f"  => {len(new_ids)} produktow ({len(new)} nowych, lacznie {len(ids)})")
+
+        if ids:
+            result = ids[:limit]
+            self.logger.ok(f"recommend.feed: {len(result)} product_id do sprawdzenia")
+            return result
+
+        # Krok 2: feed.itemids.get (lzejszy endpoint, ta sama lista feedow z hintami)
+        self.logger.warn("recommend.feed puste — proba feed.itemids.get...")
+        for feed_name in feed_names:
+            if len(ids) >= limit:
+                break
+            hint = _country_hint_for_feed(feed_name)
+            tag = f"[Local+ {hint}]" if hint else "[mix]"
+            self.logger.ok(f"  feed.itemids {tag}: {feed_name!r}...")
+            new_ids = self._ids_from_feed_itemids(feed_name, limit)
+            new = [pid for pid in new_ids if pid not in seen]
+            ids.extend(new)
+            seen.update(new)
+            self.logger.ok(f"  => {len(new_ids)} ID ({len(new)} nowych, lacznie {len(ids)})")
+
+        if ids:
+            result = ids[:limit]
+            self.logger.ok(f"feed.itemids: {len(result)} product_id do sprawdzenia")
+            return result
+
+        # Krok 3: text.search po keywords
+        keywords = [keyword] if keyword else DS_SEARCH_KEYWORDS
+        self.logger.warn(
+            f"Feedy puste — proba text.search ({len(keywords)} keywords, country={country})..."
+        )
+        for kw in keywords:
+            if len(ids) >= limit:
+                break
+            new_ids = self._ids_from_text_search(kw, country, page_size=50)
+            new = [pid for pid in new_ids if pid not in seen]
+            ids.extend(new)
+            seen.update(new)
+            self.logger.ok(
+                f"  {kw!r}: {len(new_ids)} wynikow ({len(new)} nowych, lacznie {len(ids)})"
+            )
+
+        if ids:
+            result = ids[:limit]
+            self.logger.ok(f"text.search: {len(result)} product_id do sprawdzenia")
+            return result
+
+        raise AliExpressAPIError(
+            "Brak produktow w feedach DS. "
+            "Dodaj produkty recznie do SEED_PRODUCT_IDS lub poczekaj na aktywacje konta."
+        )
+
+    def fetch_products(
+        self,
+        ship_from_countries: List[str],
+        limit: int,
+        exclude_ids: Optional[set] = None,
+    ) -> List[Product]:
+        """
+        Kompletny workflow pobierania produktow z AliExpress.
+
+        1. Wyszukuje id produktow z europejskich magazynow.
+        2. Dla kazdego pobiera szczegoly i informacje o dostawie.
+        3. Zwraca liste obiektow Product.
+
+        Args:
+            ship_from_countries: Lista kodow krajow EU.
+            limit: Maksymalna liczba produktow.
+        """
+        self.logger.ok(f"AliExpress: wyszukuje do {limit} produktow z {ship_from_countries}...")
+        try:
+            product_ids = self.search_products(
+                ship_from_countries, limit, exclude_ids=exclude_ids
+            )
+        except AliExpressAPIError as e:
+            self.logger.fail(f"Nie udalo sie wyszukac produktow: {e}")
+            return []
+
+        self.logger.ok(f"AliExpress: znaleziono {len(product_ids)} produktow")
+        products: List[Product] = []
+
+        eu_set = {c.upper() for c in ship_from_countries} if ship_from_countries else set()
+
+        for idx, pid in enumerate(product_ids, start=1):
+            if len(products) >= limit:
+                break
+            try:
+                time.sleep(1.0)  # 1s miedzy wywolaniami ds.product.get
+                raw_product = self.get_product(pid)
+
+                # DEBUG: surowa odpowiedz ds.product.get
+                if "aliexpress_ds_product_get_response" in raw_product:
+                    ds_result = raw_product["aliexpress_ds_product_get_response"].get("result", {})
+                else:
+                    ds_result = raw_product.get("result", {})
+                ds_logistics = ds_result.get("logistics_info_dto", {})
+                raw_ship_from = str(ds_logistics.get("ship_from_country", "")).upper() or "BRAK"
+                ds_ok = bool(ds_result)
+                # Sprawdz tez ship_from w SKU properties
+                sku_list = ds_result.get("ae_item_sku_info_dtos", [])
+                if isinstance(sku_list, dict):
+                    sku_list = sku_list.get("ae_item_sku_info_d_t_o", [])
+                sku_ship_from = ""
+                for sku in (sku_list or []):
+                    raw_p = sku.get("ae_sku_property_dtos", [])
+                    if isinstance(raw_p, dict):
+                        p_list = (
+                            raw_p.get("ae_sku_property_d_t_o")
+                            or (list(raw_p.values())[0] if raw_p else [])
+                        )
+                        if not isinstance(p_list, list):
+                            p_list = [p_list]
+                    elif isinstance(raw_p, list):
+                        p_list = raw_p
+                    else:
+                        p_list = []
+                    for prop in p_list:
+                        if not isinstance(prop, dict):
+                            continue
+                        if (prop.get("sku_property_id") == 200007763
+                                or prop.get("sku_property_name", "") == "Ships From"):
+                            sku_ship_from = prop.get("sku_property_value", "")
+                            break
+                    if sku_ship_from:
+                        break
+                # Loguj surowy typ ae_sku_property_dtos dla diagnozy
+                if sku_list:
+                    raw_p_sample = sku_list[0].get("ae_sku_property_dtos", "BRAK")
+                    self.logger.ok(
+                        f"    [DEBUG] ae_sku_property_dtos type={type(raw_p_sample).__name__} "
+                        f"sample={str(raw_p_sample)[:200]}"
+                    )
+                ship_display = sku_ship_from or raw_ship_from
+                self.logger.ok(
+                    f"  [{idx}/{len(product_ids)}] {pid} | "
+                    f"DS: {'OK' if ds_ok else 'BRAK'} | "
+                    f"ship_from={ship_display!r} | "
+                    f"EU={ship_display.upper() in eu_set if eu_set else 'brak_filtru'}"
+                )
+                if not ds_ok:
+                    self.logger.warn(f"    => pusta odpowiedz: {str(raw_product)[:300]}")
+
+                raw_shipping = self.query_shipping(pid)
+                product = self._parse_product(raw_product, raw_shipping, allowed_countries=eu_set)
+                if product is None:
+                    self.logger.warn(f"    => _parse_product zwrocil None (brak id/tytulu/ceny)")
+                    continue
+                # Filtruj po magazynie EU
+                if eu_set and product.ship_from_country not in eu_set:
+                    self.logger.warn(
+                        f"    => ODRZUCONY — ship_from={product.ship_from_country} "
+                        f"nie w EU {sorted(eu_set)}"
+                    )
+                    continue
+                products.append(product)
+                self.logger.ok(
+                    f"    => PRZYJETY: {product.title[:55]} [{product.ship_from_country}] "
+                    f"{product.price:.2f} PLN stock={product.stock}"
+                )
+            except AliExpressAPIError as e:
+                self.logger.warn(f"  [{idx}/{len(product_ids)}] {pid}: API error: {e}")
+                continue
+            except Exception as e:  # pragma: no cover — defensywne
+                self.logger.warn(f"  [{idx}/{len(product_ids)}] {pid}: nieoczekiwany blad: {e}")
+                continue
+
+        return products
+
+    def _parse_product(
+        self,
+        raw_product: Dict[str, Any],
+        raw_shipping: Dict[str, Any],
+        allowed_countries: Optional[set] = None,
+    ) -> Optional[Product]:
+        """
+        Konwertuje surowa odpowiedz API na obiekt Product.
+
+        Zwraca None jesli brakuje krytycznych pol (id, tytul, cena).
+        """
+        # Odpowiedz moze miec klucz opakowujacy lub "result" bezposrednio na gorze
+        if "aliexpress_ds_product_get_response" in raw_product:
+            root = raw_product["aliexpress_ds_product_get_response"].get("result", {})
+        else:
+            root = raw_product.get("result", {})
+        if not root:
+            return None
+
+        base_info = root.get("ae_item_base_info_dto", {})
+        multimedia = root.get("ae_multimedia_info_dto", {})
+        store_info = root.get("ae_store_info", {})
+        logistics = root.get("logistics_info_dto", {})
+        package_info = root.get("package_info_dto", {})
+
+        # ae_item_sku_info_dtos: moze byc lista lub dict z lista wewnatrz
+        raw_skus = root.get("ae_item_sku_info_dtos", [])
+        if isinstance(raw_skus, dict):
+            sku_info_list: List[Dict[str, Any]] = raw_skus.get("ae_item_sku_info_d_t_o", [])
+        elif isinstance(raw_skus, list):
+            sku_info_list = raw_skus
+        else:
+            sku_info_list = []
+
+        product_id = str(base_info.get("product_id", ""))
+        if not product_id:
+            return None
+
+        title = base_info.get("subject", "").strip()
+        description = base_info.get("detail", "") or base_info.get("product_description", "")
+
+        # Zdjecia z image_urls (string z ";")
+        images: List[str] = []
+        image_urls = multimedia.get("image_urls", "")
+        if isinstance(image_urls, str):
+            images = [u.strip() for u in image_urls.split(";") if u.strip()]
+        elif isinstance(image_urls, list):
+            images = [str(u).strip() for u in image_urls if u]
+
+        # Mapowanie pelnych nazw krajow na kody ISO (uzywane przy parsowaniu SKU)
+        COUNTRY_MAP: Dict[str, str] = {
+            # angielskie
+            "poland": "PL",
+            "germany": "DE", "deutschland": "DE",
+            "czech republic": "CZ", "czechia": "CZ",
+            "spain": "ES", "españa": "ES",
+            "france": "FR",
+            "italy": "IT", "italia": "IT",
+            "netherlands": "NL", "holland": "NL",
+            "united kingdom": "GB", "uk": "GB",
+            "united states": "US", "usa": "US",
+            "china": "CN",
+            "australia": "AU",
+            "japan": "JP",
+            # polskie
+            "polska": "PL", "polonia": "PL",
+            "niemcy": "DE",
+            "republika czeska": "CZ",
+            "hiszpania": "ES",
+            "francja": "FR",
+            "włochy": "IT", "wlochy": "IT",
+            "holandia": "NL", "niderlandy": "NL",
+            "wielka brytania": "GB", "wielka brytania": "GB",
+            "stany zjednoczone": "US",
+            "japonia": "JP",
+            "australia": "AU",
+            "chiny": "CN",
+        }
+
+        # Ceny i SKU
+        price: float = 0.0
+        price_original: float = 0.0
+        sku_code: str = ""
+        stock: int = 0
+        currency: str = "PLN"
+        variants: List[Dict[str, Any]] = []
+        all_ship_from_values: List[str] = []  # wszystkie raw wartosci ze wszystkich SKU
+
+        for sku in sku_info_list:
+            sku_price = float(sku.get("sku_price", 0) or 0)
+            offer_price = float(sku.get("offer_sale_price", 0) or 0)
+            # Cena zakupu = minimum z obu — offer_sale_price moze byc wyzsza
+            # niz sku_price (np. po odliczeniu kuponu AliExpress)
+            if offer_price > 0 and sku_price > 0:
+                effective_price = min(offer_price, sku_price)
+            elif offer_price > 0:
+                effective_price = offer_price
+            else:
+                effective_price = sku_price
+            sku_stock = int(sku.get("sku_available_stock", 0) or 0)
+            sku_id = str(sku.get("sku_id", ""))
+
+            variants.append({
+                "sku_id": sku_id,
+                "price": effective_price,
+                "stock": sku_stock,
+            })
+            if price == 0.0 or (effective_price > 0 and effective_price < price):
+                price = effective_price
+                price_original = sku_price
+                sku_code = sku_id
+            stock += sku_stock
+
+            # Zbierz ship_from ze WSZYSTKICH wariantow SKU
+            raw_props = sku.get("ae_sku_property_dtos", [])
+            if isinstance(raw_props, dict):
+                # Moze byc owiniety w ae_sku_property_d_t_o lub bezposrednio
+                props: List[Any] = (
+                    raw_props.get("ae_sku_property_d_t_o")
+                    or raw_props.get("ae_sku_property_dtos")
+                    or list(raw_props.values())[0] if raw_props else []
+                )
+                if not isinstance(props, list):
+                    props = [props]
+            elif isinstance(raw_props, list):
+                props = raw_props
+            else:
+                props = []
+
+            for prop in props:
+                if not isinstance(prop, dict):
+                    continue
+                prop_id = prop.get("sku_property_id")
+                prop_name = str(prop.get("sku_property_name", "")).strip()
+                # Szukaj po ID (200007763) lub nazwie "Ships From"
+                if prop_id == 200007763 or prop_name == "Ships From":
+                    val = str(prop.get("sku_property_value", "")).strip()
+                    if val and val not in all_ship_from_values:
+                        all_ship_from_values.append(val)
+
+        if sku_info_list:
+            currency = sku_info_list[0].get("currency_code", "PLN")
+
+        if price == 0.0:
+            return None
+
+        # Waga i wymiary
+        weight_kg = float(package_info.get("package_weight", 0) or 0)
+        length_cm = float(package_info.get("package_length", 0) or 0)
+        width_cm = float(package_info.get("package_width", 0) or 0)
+        height_cm = float(package_info.get("package_height", 0) or 0)
+
+        # Loguj wszystkie raw ship_from values ze SKU
+        logistics_ship_from = logistics.get("ship_from_country", "")
+        self.logger.ok(
+            f"    ship_from raw values: {all_ship_from_values} "
+            f"| logistics: {logistics_ship_from!r} "
+            f"| sku_count={len(sku_info_list)}"
+        )
+
+        # Zamien raw wartosci na kody ISO i wybierz EU jesli dostepne
+        def to_code(raw: str) -> str:
+            return COUNTRY_MAP.get(raw.strip().lower(), raw.strip().upper())
+
+        sku_codes = [to_code(v) for v in all_ship_from_values]
+        logistics_code = to_code(logistics_ship_from) if logistics_ship_from else ""
+
+        # Priorytet: 1) kraj z allowed_countries, 2) dowolny kraj EU, 3) cokolwiek
+        # GB usuniete — Wielka Brytania nie jest czlonkiem UE od Brexitu
+        EU_CODES = {"PL", "DE", "CZ", "ES", "FR", "IT", "NL", "BE", "AT", "SE", "DK", "FI", "PT", "HU", "RO", "SK", "HR", "SI", "BG", "LT", "LV", "EE"}
+        allowed = allowed_countries or set()
+        allowed_found = [c for c in sku_codes if c in allowed]
+        eu_found = [c for c in sku_codes if c in EU_CODES]
+        if allowed_found:
+            ship_from_code = allowed_found[0]
+        elif eu_found:
+            ship_from_code = eu_found[0]
+        elif sku_codes:
+            ship_from_code = sku_codes[0]
+        elif logistics_code:
+            ship_from_code = logistics_code
+        else:
+            ship_from_code = "CN"
+
+        # Czas dostawy
+        estimated_days = int(logistics.get("delivery_time", 30) or 30)
+
+        # Nadpisanie przez shipping query jesli dostepne
+        shipping_root = raw_shipping.get(
+            "aliexpress_ds_shipping_info_query_response", {}
+        ).get("result", {})
+        if not shipping_root:
+            shipping_root = raw_shipping.get("result", {})
+        freight_list = shipping_root.get("freight_list", {}).get("freight_item", [])
+        if isinstance(freight_list, list) and freight_list:
+            fastest = min(
+                (int(opt.get("estimate_delivery_days", estimated_days) or estimated_days)
+                 for opt in freight_list),
+                default=estimated_days,
+            )
+            estimated_days = fastest
+
+        return Product(
+            product_id=product_id,
+            title=title,
+            description=description,
+            images=images,
+            price=price,
+            price_original=price_original,
+            currency=currency,
+            sku=sku_code or product_id,
+            stock=stock,
+            seller_id=str(store_info.get("store_id", "")),
+            seller_rating=float(store_info.get("communication_rating", 0) or 0),
+            ship_from_country=ship_from_code,
+            estimated_delivery_days=estimated_days,
+            variants=variants,
+            weight_kg=weight_kg,
+            length_cm=length_cm,
+            width_cm=width_cm,
+            height_cm=height_cm,
+        )
+
+
+def get_mock_products() -> List[Product]:
+    """
+    Zwraca 10 zahardkodowanych produktow do trybu testowego.
+
+    Produkty obejmuja rozne kategorie (elektronika, sport, dom, akcesoria)
+    i maja rozne poziomy jakosci aby mozna bylo sprawdzic zarowno akceptacje
+    jak i odrzucenie przez Claude.
+    """
+    return [
+        Product(
+            product_id="1005006123456789",
+            title="Universal Bike Phone Holder 360 Rotation Waterproof Motorcycle Mount",
+            description=(
+                "High quality aluminum alloy phone holder. Fits all smartphones "
+                "from 4.7 to 7 inches. 360 degree rotation, shockproof design, "
+                "easy installation on handlebar 22-32mm."
+            ),
+            images=[
+                "https://ae01.alicdn.com/kf/S01/mock-bike-holder-1.jpg",
+                "https://ae01.alicdn.com/kf/S01/mock-bike-holder-2.jpg",
+                "https://ae01.alicdn.com/kf/S01/mock-bike-holder-3.jpg",
+            ],
+            price=18.50,
+            price_original=29.90,
+            currency="PLN",
+            sku="BIKE-HOLDER-BLK",
+            stock=247,
+            seller_id="store_001",
+            seller_rating=4.8,
+            ship_from_country="PL",
+            estimated_delivery_days=4,
+            variants=[
+                {"sku_id": "BIKE-HOLDER-BLK", "price": 18.50, "stock": 120},
+                {"sku_id": "BIKE-HOLDER-SLV", "price": 19.50, "stock": 127},
+            ],
+            weight_kg=0.15, length_cm=12.0, width_cm=8.0, height_cm=5.0,
+        ),
+        Product(
+            product_id="1005006234567890",
+            title="USB-C Cable 2m Fast Charging 100W Nylon Braided Type-C to Type-C",
+            description=(
+                "Premium nylon braided USB-C cable. Supports 100W PD fast charging "
+                "and USB 3.1 data transfer up to 10Gbps. 2 meter length, durable "
+                "aluminum connectors, compatible with MacBook, iPad, Samsung."
+            ),
+            images=[
+                "https://ae01.alicdn.com/kf/S01/mock-usbc-1.jpg",
+                "https://ae01.alicdn.com/kf/S01/mock-usbc-2.jpg",
+            ],
+            price=12.30,
+            price_original=24.90,
+            currency="PLN",
+            sku="USBC-2M-BLK",
+            stock=890,
+            seller_id="store_002",
+            seller_rating=4.9,
+            ship_from_country="CZ",
+            estimated_delivery_days=5,
+            variants=[
+                {"sku_id": "USBC-2M-BLK", "price": 12.30, "stock": 450},
+                {"sku_id": "USBC-2M-WHT", "price": 12.30, "stock": 440},
+            ],
+            weight_kg=0.08, length_cm=15.0, width_cm=8.0, height_cm=3.0,
+        ),
+        Product(
+            product_id="1005006345678901",
+            title="cheap plastic keychain key ring lot 100pcs color random",
+            description="random color plastic keychain cheap good quality bulk.",
+            images=[
+                "https://ae01.alicdn.com/kf/S01/mock-keychain-1.jpg",
+            ],
+            price=2.10,
+            price_original=3.50,
+            currency="PLN",
+            sku="KEYCHAIN-RND",
+            stock=50,
+            seller_id="store_003",
+            seller_rating=3.9,
+            ship_from_country="PL",
+            estimated_delivery_days=6,
+            variants=[
+                {"sku_id": "KEYCHAIN-RND", "price": 2.10, "stock": 50},
+            ],
+            weight_kg=0.05, length_cm=10.0, width_cm=6.0, height_cm=2.0,
+        ),
+        Product(
+            product_id="1005006456789012",
+            title="Smart LED Strip Light 5m RGB WiFi Alexa Google Home Compatible",
+            description=(
+                "5 meter RGB LED strip with WiFi control. Works with Alexa and "
+                "Google Home. 16 million colors, music sync mode, timer function. "
+                "Easy to install with self-adhesive backing. Power adapter included."
+            ),
+            images=[
+                "https://ae01.alicdn.com/kf/S01/mock-led-1.jpg",
+                "https://ae01.alicdn.com/kf/S01/mock-led-2.jpg",
+                "https://ae01.alicdn.com/kf/S01/mock-led-3.jpg",
+                "https://ae01.alicdn.com/kf/S01/mock-led-4.jpg",
+            ],
+            price=45.80,
+            price_original=89.90,
+            currency="PLN",
+            sku="LED-RGB-5M",
+            stock=178,
+            seller_id="store_004",
+            seller_rating=4.7,
+            ship_from_country="DE",
+            estimated_delivery_days=7,
+            variants=[
+                {"sku_id": "LED-RGB-5M", "price": 45.80, "stock": 88},
+                {"sku_id": "LED-RGB-10M", "price": 79.80, "stock": 90},
+            ],
+            weight_kg=0.30, length_cm=20.0, width_cm=10.0, height_cm=5.0,
+        ),
+        Product(
+            product_id="1005006567890123",
+            title="Waterproof Sport Fitness Tracker Smart Watch Heart Rate Monitor",
+            description=(
+                "Fitness smartwatch with heart rate and blood oxygen monitoring. "
+                "IP68 waterproof, 14 sports modes, sleep tracking, call and message "
+                "notifications. 1.4 inch color display, 7 day battery life."
+            ),
+            images=[
+                "https://ae01.alicdn.com/kf/S01/mock-watch-1.jpg",
+                "https://ae01.alicdn.com/kf/S01/mock-watch-2.jpg",
+                "https://ae01.alicdn.com/kf/S01/mock-watch-3.jpg",
+            ],
+            price=78.40,
+            price_original=149.00,
+            currency="PLN",
+            sku="SMARTWATCH-BLK",
+            stock=95,
+            seller_id="store_005",
+            seller_rating=4.6,
+            ship_from_country="ES",
+            estimated_delivery_days=8,
+            variants=[
+                {"sku_id": "SMARTWATCH-BLK", "price": 78.40, "stock": 45},
+                {"sku_id": "SMARTWATCH-SLV", "price": 78.40, "stock": 50},
+            ],
+            weight_kg=0.12, length_cm=9.0, width_cm=7.0, height_cm=4.0,
+        ),
+        Product(
+            product_id="1005006678901234",
+            title="bad qualit broken item NO RETURN not working use own risk china",
+            description="item NO working, use at own risk, no refund. buyer beware.",
+            images=[
+                "https://ae01.alicdn.com/kf/S01/mock-broken-1.jpg",
+            ],
+            price=1.99,
+            price_original=1.99,
+            currency="PLN",
+            sku="BROKEN-001",
+            stock=10,
+            seller_id="store_006",
+            seller_rating=2.1,
+            ship_from_country="PL",
+            estimated_delivery_days=4,
+            variants=[{"sku_id": "BROKEN-001", "price": 1.99, "stock": 10}],
+            weight_kg=0.05, length_cm=5.0, width_cm=5.0, height_cm=2.0,
+        ),
+        Product(
+            product_id="1005006789012345",
+            title="Foldable Camping Chair Lightweight Portable Outdoor Fishing Beach",
+            description=(
+                "Ultra-light foldable camping chair, weighs only 1kg. Holds up to "
+                "150kg. Compact carry bag included. Perfect for camping, fishing, "
+                "festivals and beach. Durable aluminum frame and 600D oxford fabric."
+            ),
+            images=[
+                "https://ae01.alicdn.com/kf/S01/mock-chair-1.jpg",
+                "https://ae01.alicdn.com/kf/S01/mock-chair-2.jpg",
+                "https://ae01.alicdn.com/kf/S01/mock-chair-3.jpg",
+            ],
+            price=58.90,
+            price_original=119.00,
+            currency="PLN",
+            sku="CAMP-CHAIR-GRN",
+            stock=143,
+            seller_id="store_007",
+            seller_rating=4.8,
+            ship_from_country="DE",
+            estimated_delivery_days=6,
+            variants=[
+                {"sku_id": "CAMP-CHAIR-GRN", "price": 58.90, "stock": 70},
+                {"sku_id": "CAMP-CHAIR-BLU", "price": 58.90, "stock": 73},
+            ],
+            weight_kg=1.20, length_cm=55.0, width_cm=12.0, height_cm=12.0,
+        ),
+        Product(
+            product_id="1005006890123456",
+            title="Kitchen Electric Garlic Chopper Wireless Mini Food Processor USB",
+            description=(
+                "Wireless USB rechargeable mini food chopper. Perfect for garlic, "
+                "onions, herbs, nuts. 250ml capacity, stainless steel blades, "
+                "one-touch operation. Easy to clean, dishwasher safe bowl."
+            ),
+            images=[
+                "https://ae01.alicdn.com/kf/S01/mock-chopper-1.jpg",
+                "https://ae01.alicdn.com/kf/S01/mock-chopper-2.jpg",
+            ],
+            price=32.50,
+            price_original=65.00,
+            currency="PLN",
+            sku="CHOPPER-WHT",
+            stock=67,
+            seller_id="store_008",
+            seller_rating=4.5,
+            ship_from_country="PL",
+            estimated_delivery_days=3,
+            variants=[{"sku_id": "CHOPPER-WHT", "price": 32.50, "stock": 67}],
+            weight_kg=0.45, length_cm=14.0, width_cm=14.0, height_cm=12.0,
+        ),
+        Product(
+            product_id="1005006901234567",
+            title="Pet Dog Cat Automatic Water Fountain 2L Filter USB Powered Silent",
+            description=(
+                "2 liter capacity automatic pet water fountain with activated carbon "
+                "filter. USB powered, silent operation below 40dB. Stimulates pets "
+                "to drink more water, prevents stagnation. Easy to disassemble and clean."
+            ),
+            images=[
+                "https://ae01.alicdn.com/kf/S01/mock-fountain-1.jpg",
+                "https://ae01.alicdn.com/kf/S01/mock-fountain-2.jpg",
+                "https://ae01.alicdn.com/kf/S01/mock-fountain-3.jpg",
+            ],
+            price=54.20,
+            price_original=109.00,
+            currency="PLN",
+            sku="PET-FOUNTAIN-WHT",
+            stock=82,
+            seller_id="store_009",
+            seller_rating=4.7,
+            ship_from_country="FR",
+            estimated_delivery_days=7,
+            variants=[
+                {"sku_id": "PET-FOUNTAIN-WHT", "price": 54.20, "stock": 40},
+                {"sku_id": "PET-FOUNTAIN-GRY", "price": 54.20, "stock": 42},
+            ],
+            weight_kg=0.65, length_cm=22.0, width_cm=22.0, height_cm=15.0,
+        ),
+        Product(
+            product_id="1005007012345678",
+            title="Wireless Bluetooth 5.3 Earbuds ANC Noise Cancelling IPX5 30h Playtime",
+            description=(
+                "True wireless earbuds with active noise cancellation. Bluetooth 5.3, "
+                "30 hours total playtime with charging case, IPX5 water resistant. "
+                "Touch controls, built-in microphone for calls, comfortable fit."
+            ),
+            images=[
+                "https://ae01.alicdn.com/kf/S01/mock-earbuds-1.jpg",
+                "https://ae01.alicdn.com/kf/S01/mock-earbuds-2.jpg",
+                "https://ae01.alicdn.com/kf/S01/mock-earbuds-3.jpg",
+            ],
+            price=69.00,
+            price_original=139.00,
+            currency="PLN",
+            sku="EARBUDS-BLK",
+            stock=214,
+            seller_id="store_010",
+            seller_rating=4.8,
+            ship_from_country="CN",  # Ten produkt zostanie odrzucony (brak EU magazynu)
+            estimated_delivery_days=18,
+            variants=[{"sku_id": "EARBUDS-BLK", "price": 69.00, "stock": 214}],
+            weight_kg=0.10, length_cm=8.0, width_cm=6.0, height_cm=4.0,
+        ),
+    ]

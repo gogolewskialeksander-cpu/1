@@ -1,0 +1,393 @@
+#!/usr/bin/env python3
+"""
+Glowny skrypt pipeline'u dropshipping Etap 1.
+
+Uruchomienie:
+    python main.py                 # pelny tryb produkcyjny
+    python main.py --test          # tryb testowy (mock AliExpress, bez BL)
+    python main.py --limit 50      # pobierz max 50 produktow
+    python main.py --country PL    # tylko polskie magazyny
+
+Pipeline:
+    1. Konfiguracja i inicjalizacja loggera.
+    2. Pobranie produktow (AliExpress API lub mock).
+    3. Filtrowanie: magazyn EU, czas dostawy, stock, ocena sprzedawcy.
+    4. Analiza Claude (batch 10 produktow).
+    5. Filtrowanie po ocenie potencjalu.
+    6. Generowanie XML dla BaseLinker.
+    7. Wyslanie do BaseLinker (pominiete w trybie testowym).
+    8. Podsumowanie statystyk.
+
+Obsluguje SIGINT (Ctrl+C) — zapisuje postep przed wyjsciem.
+"""
+from __future__ import annotations
+
+import argparse
+import signal
+import sys
+from types import FrameType
+from typing import List, Optional
+
+from aliexpress_client import AliExpressClient, Product
+from baselinker_client import BaseLinkerClient
+from claude_analyzer import ClaudeAnalyzer, filter_by_score
+from config import (
+    FAILED_PRODUCTS_PATH,
+    LOGS_DIR,
+    OUTPUT_DIR,
+    Config,
+    ConfigError,
+    load_config,
+)
+from logger import Logger
+from seen_cache import (
+    SeenIdsCache,
+    STATUS_ACCEPTED,
+    STATUS_REJECTED_CLAUDE,
+    STATUS_REJECTED_DELIVERY,
+    STATUS_REJECTED_EU,
+    STATUS_REJECTED_STOCK,
+)
+from xml_generator import write_xml
+
+
+# Globalny logger — ustawiany w main() aby handler SIGINT mial do niego dostep.
+_GLOBAL_LOGGER: Optional[Logger] = None
+_INTERRUPTED: bool = False
+
+
+def _sigint_handler(signum: int, frame: Optional[FrameType]) -> None:
+    """Handler SIGINT — loguje przerwanie i ustawia flage."""
+    global _INTERRUPTED
+    _INTERRUPTED = True
+    if _GLOBAL_LOGGER is not None:
+        _GLOBAL_LOGGER.warn("Przerwane przez uzytkownika (Ctrl+C). Zapisuje postep...")
+    else:
+        print("\n[WARN] Przerwane przez uzytkownika (Ctrl+C).", flush=True)
+
+
+def filter_eu_warehouses(
+    products: List[Product],
+    allowed_countries: List[str],
+    logger: Logger,
+) -> List[Product]:
+    """
+    Filtruje produkty pozostawiajac tylko te z dozwolonych krajow wysylki.
+
+    Args:
+        products: Lista produktow do przefiltrowania.
+        allowed_countries: Lista kodow krajow (np. ['PL', 'DE']).
+        logger: Instancja loggera.
+    """
+    allowed_set = {c.upper() for c in allowed_countries}
+    kept: List[Product] = []
+    for product in products:
+        if product.ship_from_country.upper() in allowed_set:
+            kept.append(product)
+        else:
+            logger.stats.filtered_out_eu += 1
+    logger.ok(
+        f"Filtrowanie EU magazynow... {len(kept)}/{len(products)} przeszlo"
+    )
+    return kept
+
+
+def filter_delivery_time(
+    products: List[Product],
+    max_days: int,
+    logger: Logger,
+) -> List[Product]:
+    """Odrzuca produkty z czasem dostawy powyzej max_days."""
+    kept: List[Product] = []
+    for product in products:
+        if product.estimated_delivery_days <= max_days:
+            kept.append(product)
+        else:
+            logger.stats.filtered_out_delivery += 1
+    if len(kept) < len(products):
+        logger.ok(
+            f"Filtrowanie czasu dostawy (max {max_days} dni)... "
+            f"{len(kept)}/{len(products)} przeszlo"
+        )
+    return kept
+
+
+def filter_stock_and_rating(
+    products: List[Product],
+    min_stock: int,
+    min_rating: float,
+    logger: Logger,
+) -> List[Product]:
+    """Odrzuca produkty z niskim stockiem lub niska ocena sprzedawcy."""
+    kept: List[Product] = []
+    for product in products:
+        if product.stock < min_stock:
+            logger.stats.filtered_out_stock += 1
+            continue
+        # Ocena sprzedawcy: akceptujemy rowniez 0 jesli brak danych (w trybie testowym)
+        if product.seller_rating and product.seller_rating < min_rating:
+            logger.stats.filtered_out_stock += 1
+            continue
+        kept.append(product)
+    if len(kept) < len(products):
+        logger.ok(
+            f"Filtrowanie stock/rating... {len(kept)}/{len(products)} przeszlo"
+        )
+    return kept
+
+
+def parse_args() -> argparse.Namespace:
+    """Parsuje argumenty CLI."""
+    parser = argparse.ArgumentParser(
+        description="Etap 1: pobieranie AliExpress -> Claude -> XML -> BaseLinker",
+    )
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Szybki tryb testowy: fetch=20, accept=10, batch Claude=10, bez BaseLinker (~2-3 min)",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Docelowa liczba ZAAKCEPTOWANYCH produktow (nadpisuje MAX_PRODUCTS_PER_RUN)",
+    )
+    parser.add_argument(
+        "--fetch-batch",
+        type=int,
+        default=100,
+        dest="fetch_batch",
+        help="Ile produktow pobierac z AliExpress na runde (domyslnie 100)",
+    )
+    parser.add_argument(
+        "--baselinker",
+        action="store_true",
+        help="Włącz wysyłkę do BaseLinker (domyślnie wyłączona)",
+    )
+    parser.add_argument(
+        "--country",
+        type=str,
+        default=None,
+        help="Ogranicz do jednego kraju wysylki (np. PL)",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        dest="no_cache",
+        help="Ignoruj persystentny cache seen_ids.json (wymusza re-sprawdzenie wszystkich produktow)",
+    )
+    return parser.parse_args()
+
+
+def run_pipeline(config: Config, args: argparse.Namespace, logger: Logger) -> int:
+    """
+    Uruchamia caly pipeline Etapu 1.
+
+    Returns:
+        Kod wyjscia (0 = sukces, inne = blad).
+    """
+    # Aplikacja parametrow CLI na config
+    # --test: szybki run — fetch=20, accept=10, batch Claude=10, bez BaseLinker
+    if args.test:
+        target_accepted = 10
+        fetch_batch = 20
+        claude_batch = 10
+        logger.ok("Tryb --test: fetch=20, accept=10, batch Claude=10, bez BaseLinker")
+    else:
+        target_accepted = args.limit if args.limit is not None else config.max_products_per_run
+        fetch_batch = args.fetch_batch
+        claude_batch = None  # uzyj domyslnego BATCH_SIZE=25
+
+    if args.country:
+        config.ship_from_countries = [args.country.upper()]
+
+    logger.ok("Konfiguracja zaladowana")
+
+    # ===== CACHE =====
+    cache_path = OUTPUT_DIR / "seen_ids.json"
+    if args.no_cache:
+        logger.ok("Cache: wylaczony (--no-cache)")
+        cache = SeenIdsCache.empty(cache_path)
+    else:
+        cache = SeenIdsCache.load(cache_path, logger)
+
+    # ===== TRYB PRODUKCYJNY: PETLA DO TARGET =====
+    ae_client = AliExpressClient(
+        app_key=config.aliexpress_app_key,
+        app_secret=config.aliexpress_app_secret,
+        access_token=config.aliexpress_access_token,
+        logger=logger,
+    )
+    analyzer = ClaudeAnalyzer(
+        api_key=config.anthropic_api_key,
+        logger=logger,
+        batch_size=claude_batch,
+    )
+
+    all_accepted: List[Product] = []
+    # all_seen_ids zawiera cache + ID z biezacego runu (do exclude_ids)
+    all_seen_ids: set = cache.get_all_ids()
+    if all_seen_ids and not args.no_cache:
+        logger.ok(f"Runda 0: pomijam {len(all_seen_ids)} znane ID z cache")
+
+    round_num = 0
+    no_new_rounds = 0
+    MAX_EMPTY_ROUNDS = 3
+
+    try:
+        while len(all_accepted) < target_accepted:
+            if _INTERRUPTED:
+                return 130
+
+            round_num += 1
+            logger.ok(
+                f"Runda {round_num}: pobieranie {fetch_batch} produktow "
+                f"(zaakceptowane: {len(all_accepted)}/{target_accepted})"
+            )
+
+            products = ae_client.fetch_products(
+                ship_from_countries=config.ship_from_countries,
+                limit=fetch_batch,
+                exclude_ids=all_seen_ids,
+            )
+
+            if not products:
+                no_new_rounds += 1
+                logger.warn(
+                    f"Runda {round_num}: brak nowych produktow "
+                    f"({no_new_rounds}/{MAX_EMPTY_ROUNDS} pustych rund)"
+                )
+                if no_new_rounds >= MAX_EMPTY_ROUNDS:
+                    logger.warn("Wyczerpano zrodla produktow. Przerywam petle.")
+                    break
+                continue
+
+            no_new_rounds = 0
+            all_seen_ids.update(p.product_id for p in products)
+            logger.stats.fetched_from_aliexpress += len(products)
+
+            # Filtrowanie z rejestracją statusów w cache
+            fetched_ids = {p.product_id for p in products}
+
+            products = filter_eu_warehouses(products, config.ship_from_countries, logger)
+            eu_passed = {p.product_id for p in products}
+            for pid in fetched_ids - eu_passed:
+                cache.mark(pid, STATUS_REJECTED_EU)
+
+            products = filter_delivery_time(products, config.max_delivery_days, logger)
+            delivery_passed = {p.product_id for p in products}
+            for pid in eu_passed - delivery_passed:
+                cache.mark(pid, STATUS_REJECTED_DELIVERY)
+
+            products = filter_stock_and_rating(
+                products, config.min_stock, config.min_seller_rating, logger
+            )
+            stock_passed = {p.product_id for p in products}
+            for pid in delivery_passed - stock_passed:
+                cache.mark(pid, STATUS_REJECTED_STOCK)
+
+            if not products:
+                logger.warn(f"Runda {round_num}: wszystkie produkty odfiltrowane.")
+                continue
+
+            if _INTERRUPTED:
+                return 130
+
+            # Analiza Claude
+            products = analyzer.analyze_products(products)
+
+            if _INTERRUPTED:
+                return 130
+
+            new_accepted = filter_by_score(products, config.min_potential_score, logger)
+            accepted_ids = {p.product_id for p in new_accepted}
+            for p in products:
+                if p.product_id in accepted_ids:
+                    cache.mark(p.product_id, STATUS_ACCEPTED)
+                else:
+                    cache.mark(p.product_id, STATUS_REJECTED_CLAUDE)
+
+            all_accepted.extend(new_accepted)
+            logger.ok(
+                f"Runda {round_num}: +{len(new_accepted)} zaakceptowanych "
+                f"(lacznie {len(all_accepted)}/{target_accepted})"
+            )
+    finally:
+        if not args.no_cache:
+            cache.save()
+            logger.ok(f"Cache zapisany: {len(cache.get_all_ids())} ID -> {cache_path}")
+
+    # Przytnij do dokladnego targetu
+    accepted = all_accepted[:target_accepted]
+
+    if not accepted:
+        logger.warn("Nie zaakceptowano zadnego produktu.")
+        logger.print_summary()
+        return 0
+
+    # ===== GENEROWANIE XML =====
+    try:
+        xml_path = write_xml(
+            products=accepted,
+            output_dir=OUTPUT_DIR,
+            margin_percent=config.margin_target_percent,
+            logger=logger,
+        )
+    except Exception as e:
+        logger.fail(f"Nie udalo sie wygenerowac XML: {e}")
+        logger.print_summary()
+        return 2
+
+    # ===== WYSYLKA DO BASELINKER =====
+    if args.test:
+        logger.ok("Tryb --test: pomijam wysylke do BaseLinker")
+    elif not args.baselinker:
+        logger.ok("Pominieto wysylke do BaseLinker (dodaj --baselinker zeby wyslac)")
+    else:
+        bl_client = BaseLinkerClient(
+            token=config.baselinker_api_token,
+            inventory_id=config.baselinker_inventory_id,
+            storage_id=config.baselinker_storage_id,
+            margin_percent=config.margin_target_percent,
+            logger=logger,
+        )
+        bl_client.upload_products(accepted, FAILED_PRODUCTS_PATH)
+
+    # ===== PODSUMOWANIE =====
+    logger.ok(f"GOTOWE: {len(accepted)} produktow gotowych do importu")
+    logger.ok(f"Plik XML: {xml_path}")
+    logger.print_summary()
+    return 0
+
+
+def main() -> int:
+    """Punkt wejscia. Zwraca kod wyjscia procesu."""
+    global _GLOBAL_LOGGER
+
+    args = parse_args()
+
+    try:
+        config = load_config(test_mode=args.test)
+        config.validate()
+    except ConfigError as e:
+        print(f"[FAIL] Blad konfiguracji:\n{e}", file=sys.stderr, flush=True)
+        return 3
+
+    logger = Logger(logs_dir=LOGS_DIR)
+    _GLOBAL_LOGGER = logger
+    signal.signal(signal.SIGINT, _sigint_handler)
+
+    try:
+        exit_code = run_pipeline(config, args, logger)
+    except Exception as e:
+        logger.fail(f"Nieoczekiwany blad pipeline'u: {e}")
+        logger.print_summary()
+        exit_code = 1
+    finally:
+        logger.close()
+
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

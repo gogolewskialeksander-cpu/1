@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+logs/*.log
+output/*.xml
+failed_products.json
+.venv/
+venv/
+.DS_Store
