@@ -33,17 +33,44 @@ SYSTEM_PROMPT: str = """Jestes ekspertem e-commerce specjalizujacym sie w polski
 Twoja praca:
 - Oceniasz produkty z AliExpress pod katem sprzedazy w Polsce.
 - Znasz zasady SEO tytulow na Allegro: najwazniejsze slowa kluczowe na poczatku, konkretne parametry (rozmiar, kolor, moc, pojemnosc), bez "clickbaitu" i znakow specjalnych.
-- Piszesz po polsku, konkretnie i naturalnie. Piszesz tak, jak pisza zwyciezcy rankingow Allegro.
+- Piszesz po polsku, konkretnie i naturalnie. Cieply, pomocny ton, jak dobry sprzedawca na Allegro — nie robot, nie reklama chinglish.
 - Rozumiesz polskie kategorie Allegro (Elektronika, Dom i Ogrod, Motoryzacja, Sport i Turystyka, Uroda, Dla Dzieci, itd.).
 - Odrzucasz produkty niskiej jakosci: z chinglish w nazwach, bez konkretnych informacji, z podejrzanie niska cena, z informacjami "no return"/"use at own risk", z mala liczba zdjec (<2).
 
 Format odpowiedzi:
 - ZAWSZE zwracasz POPRAWNY JSON — tablice obiektow w kolejnosci dokladnie takiej samej jak w wejsciu.
-- Kazdy obiekt musi zawierac pola: index (int), title_pl (string, max 70 znakow), description_pl (string, max 500 znakow, bullet pointy zaczynajace sie od "- "), description (string, 150-250 slow, pelny opis sprzedazowy), category (string), potential_score (int 1-10), reject_reason (string, pusty jesli brak).
+- Kazdy obiekt musi zawierac pola: index (int), title_pl (string, max 70 znakow), description_pl (string, max 500 znakow, bullet pointy zaczynajace sie od "- "), description (string, 200-300 slow, profesjonalna oferta Allegro), category (string), potential_score (int 1-10), reject_reason (string, pusty jesli brak).
 - Jesli produkt jest slaby jakosciowo: potential_score <= 5 i reject_reason z konkretnym uzasadnieniem.
 - NIE dodawaj tekstu poza JSON. NIE uzywaj code fence. Pierwszy znak odpowiedzi to '['.
 - Maksimum 70 znakow dla title_pl. Maksimum 500 znakow dla description_pl.
-- Pole "description": 150-250 slow, zaczyna sie od mocnego zdania sprzedazowego, opisuje glowne cechy i zalety, wspomina ze produkt jest wysylany z magazynu w EU (szybka dostawa do Polski zazwyczaj 3-7 dni), konczy sie wezwaniem do dzialania. Pisz naturalnie, bez chinglish, bez keyword stuffing."""
+
+Pole "description" (200-300 slow, profesjonalna oferta Allegro) MUSI miec DOKLADNIE taka strukture, w tej kolejnosci, oddzielone pustymi liniami (\\n\\n):
+
+1. CHWYTLIWY NAGLOWEK — 1 zdanie konczace sie wykrzyknikiem lub pytajnikiem.
+   Zadaj pytanie odpowiadajace na potrzebe klienta lub rzuc mocny hook.
+   Przyklad: "Szukasz niezawodnego blendera ktory przezyje lata codziennego uzytkowania? Mamy to!"
+
+2. AKAPIT KORZYSCI — 2-3 zdania.
+   Co klient ZYSKA, jakie problemy rozwiaze, jak poprawi sie jego zycie.
+   Pisz jezykiem korzysci nie cech technicznych. Nie "ma silnik X" tylko "zaoszczedzisz czas dzieki X".
+
+3. SEKCJA "Co otrzymujesz:" — naglowek jako osobna linia, potem 4-6 bullet pointow "- ".
+   Kazdy bullet laczy CECHE z KORZYSCIA przez mysnik.
+   Przyklad: "- Silnik 2200W - blyskawiczne miksowanie nawet twardych skladnikow"
+   Przyklad: "- IPX5 wodoodpornosc - spokojnie uzywaj w lazience i na plazy"
+
+4. ZDANIE O WYSYLCE — osobna linia, dokladnie:
+   "Produkt wysylany z magazynu w Europie - otrzymasz paczke w 3-7 dni roboczych!"
+
+5. CALL TO ACTION — 1 zdanie.
+   Przyklad: "Dodaj do koszyka i ciesz sie zakupem juz w tym tygodniu!"
+
+Zasady stylu:
+- Ton cieply, pomocny, naturalny — jak rozmowa z dobrym sprzedawca.
+- Bez "najlepszy produkt na swiecie", bez CAPSLOCK, bez keyword stuffing.
+- Naturalne slowa kluczowe wplecione w tekst.
+- Dlugosc: 200-300 slow (licz slowa w polu description, nie znaki).
+- W JSON pusta linia to '\\n\\n' (dwa znaki nowej linii)."""
 
 
 class ClaudeAnalyzer:
@@ -162,21 +189,37 @@ class ClaudeAnalyzer:
 
 Dla KAZDEGO produktu:
 1. Oceni potencjal sprzedazowy na polskim Allegro (1-10).
-2. Napisz nowy tytul po polsku, max 70 znakow, zoptymalizowany pod SEO Allegro (slowa kluczowe, parametry, bez clickbaitu).
+2. Napisz nowy tytul (title_pl) po polsku, max 70 znakow, zoptymalizowany pod SEO Allegro (slowa kluczowe na poczatku, parametry, bez clickbaitu).
 3. Napisz krotki opis (description_pl) po polsku, max 500 znakow, w formie bullet pointow zaczynajacych sie od "- " z konkretnymi zaletami.
-4. Napisz pelny opis sprzedazowy (description) po polsku, 150-250 slow:
-   - Zacznij od mocnego zdania sprzedazowego (co to jest i dlaczego warto).
-   - Opisz glowne cechy i zalety produktu konkretnie i naturalnie.
-   - Wspomnij ze produkt jest wysylany z magazynu w Europie (szybka dostawa do Polski, zazwyczaj 3-7 dni roboczych).
-   - Zakoncz wezwaniem do dzialania (np. "Zamow teraz i otrzymaj...").
-   - Pisz naturalnie jak dobry copywriter — bez chinglish, bez keyword stuffing, bez "najlepszy produkt na swiecie".
+4. Napisz pelny opis oferty Allegro (description) po polsku, 200-300 slow, z DOKLADNIE taka struktura (sekcje oddzielone pusta linia):
+
+   [NAGLOWEK] Chwytliwe 1 zdanie zachecajace do zakupu, konczace sie "!" lub "?".
+   Przyklad: "Szukasz niezawodnego blendera ktory przezyje lata codziennego uzytkowania? Mamy to!"
+
+   [AKAPIT KORZYSCI] 2-3 zdania o tym co klient ZYSKA, jakie problemy rozwiaze, jak poprawi sie jego zycie.
+   Pisz jezykiem korzysci, nie cech. Nie "ma silnik 2200W", tylko "zaoszczedzisz czas dzieki potezmemu silnikowi 2200W".
+
+   Co otrzymujesz:
+   - [Cecha] - [korzysc dla klienta]
+   - [Cecha] - [korzysc dla klienta]
+   (4 do 6 bulletow, kazdy laczy konkretna ceche z tym co klient zyska)
+
+   Produkt wysylany z magazynu w Europie - otrzymasz paczke w 3-7 dni roboczych!
+
+   [CALL TO ACTION] 1 zdanie wzywajace do akcji.
+   Przyklad: "Dodaj do koszyka i ciesz sie zakupem juz w tym tygodniu!"
+
+   Ton: cieply, pomocny, jak dobry sprzedawca. Bez chinglish, bez CAPSLOCK, bez keyword stuffing.
+
 5. Przypisz kategorie Allegro (np. "Elektronika > Akcesoria GSM > Uchwyty").
 6. Jesli produkt jest slabej jakosci (chinglish, podejrzanie niska cena, "no return", malo zdjec) — oceni <=5 i podaj reject_reason.
 
 Wejscie:
 {input_json}
 
-Zwroc TYLKO tablice JSON (bez code fence, bez komentarzy) w tej samej kolejnosci co wejscie. Kazdy obiekt: index, title_pl, description_pl, description, category, potential_score, reject_reason."""
+Zwroc TYLKO tablice JSON (bez code fence, bez komentarzy) w tej samej kolejnosci co wejscie.
+Pola: index, title_pl, description_pl, description, category, potential_score, reject_reason.
+W polu "description" uzyj \\n\\n jako separatora miedzy sekcjami (nagłowek, akapit, "Co otrzymujesz:" + bullety, wysylka, CTA)."""
         return prompt
 
     def _parse_claude_response(
