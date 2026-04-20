@@ -40,6 +40,14 @@ from config import (
     load_config,
 )
 from logger import Logger
+from seen_cache import (
+    SeenIdsCache,
+    STATUS_ACCEPTED,
+    STATUS_REJECTED_CLAUDE,
+    STATUS_REJECTED_DELIVERY,
+    STATUS_REJECTED_EU,
+    STATUS_REJECTED_STOCK,
+)
 from xml_generator import write_xml
 
 
@@ -162,6 +170,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Ogranicz do jednego kraju wysylki (np. PL)",
     )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        dest="no_cache",
+        help="Ignoruj persystentny cache seen_ids.json (wymusza re-sprawdzenie wszystkich produktow)",
+    )
     return parser.parse_args()
 
 
@@ -189,6 +203,14 @@ def run_pipeline(config: Config, args: argparse.Namespace, logger: Logger) -> in
 
     logger.ok("Konfiguracja zaladowana")
 
+    # ===== CACHE =====
+    cache_path = OUTPUT_DIR / "seen_ids.json"
+    if args.no_cache:
+        logger.ok("Cache: wylaczony (--no-cache)")
+        cache = SeenIdsCache.empty(cache_path)
+    else:
+        cache = SeenIdsCache.load(cache_path, logger)
+
     # ===== TRYB PRODUKCYJNY: PETLA DO TARGET =====
     ae_client = AliExpressClient(
         app_key=config.aliexpress_app_key,
@@ -203,68 +225,97 @@ def run_pipeline(config: Config, args: argparse.Namespace, logger: Logger) -> in
     )
 
     all_accepted: List[Product] = []
-    all_seen_ids: set = set()
+    # all_seen_ids zawiera cache + ID z biezacego runu (do exclude_ids)
+    all_seen_ids: set = cache.get_all_ids()
+    if all_seen_ids and not args.no_cache:
+        logger.ok(f"Runda 0: pomijam {len(all_seen_ids)} znane ID z cache")
+
     round_num = 0
     no_new_rounds = 0
     MAX_EMPTY_ROUNDS = 3
 
-    while len(all_accepted) < target_accepted:
-        if _INTERRUPTED:
-            return 130
+    try:
+        while len(all_accepted) < target_accepted:
+            if _INTERRUPTED:
+                return 130
 
-        round_num += 1
-        logger.ok(
-            f"Runda {round_num}: pobieranie {fetch_batch} produktow "
-            f"(zaakceptowane: {len(all_accepted)}/{target_accepted})"
-        )
-
-        products = ae_client.fetch_products(
-            ship_from_countries=config.ship_from_countries,
-            limit=fetch_batch,
-            exclude_ids=all_seen_ids,
-        )
-
-        if not products:
-            no_new_rounds += 1
-            logger.warn(
-                f"Runda {round_num}: brak nowych produktow "
-                f"({no_new_rounds}/{MAX_EMPTY_ROUNDS} pustych rund)"
+            round_num += 1
+            logger.ok(
+                f"Runda {round_num}: pobieranie {fetch_batch} produktow "
+                f"(zaakceptowane: {len(all_accepted)}/{target_accepted})"
             )
-            if no_new_rounds >= MAX_EMPTY_ROUNDS:
-                logger.warn("Wyczerpano zrodla produktow. Przerywam petle.")
-                break
-            continue
 
-        no_new_rounds = 0
-        all_seen_ids.update(p.product_id for p in products)
-        logger.stats.fetched_from_aliexpress += len(products)
+            products = ae_client.fetch_products(
+                ship_from_countries=config.ship_from_countries,
+                limit=fetch_batch,
+                exclude_ids=all_seen_ids,
+            )
 
-        # Filtrowanie
-        products = filter_eu_warehouses(products, config.ship_from_countries, logger)
-        products = filter_delivery_time(products, config.max_delivery_days, logger)
-        products = filter_stock_and_rating(
-            products, config.min_stock, config.min_seller_rating, logger
-        )
+            if not products:
+                no_new_rounds += 1
+                logger.warn(
+                    f"Runda {round_num}: brak nowych produktow "
+                    f"({no_new_rounds}/{MAX_EMPTY_ROUNDS} pustych rund)"
+                )
+                if no_new_rounds >= MAX_EMPTY_ROUNDS:
+                    logger.warn("Wyczerpano zrodla produktow. Przerywam petle.")
+                    break
+                continue
 
-        if not products:
-            logger.warn(f"Runda {round_num}: wszystkie produkty odfiltrowane.")
-            continue
+            no_new_rounds = 0
+            all_seen_ids.update(p.product_id for p in products)
+            logger.stats.fetched_from_aliexpress += len(products)
 
-        if _INTERRUPTED:
-            return 130
+            # Filtrowanie z rejestracją statusów w cache
+            fetched_ids = {p.product_id for p in products}
 
-        # Analiza Claude
-        products = analyzer.analyze_products(products)
+            products = filter_eu_warehouses(products, config.ship_from_countries, logger)
+            eu_passed = {p.product_id for p in products}
+            for pid in fetched_ids - eu_passed:
+                cache.mark(pid, STATUS_REJECTED_EU)
 
-        if _INTERRUPTED:
-            return 130
+            products = filter_delivery_time(products, config.max_delivery_days, logger)
+            delivery_passed = {p.product_id for p in products}
+            for pid in eu_passed - delivery_passed:
+                cache.mark(pid, STATUS_REJECTED_DELIVERY)
 
-        new_accepted = filter_by_score(products, config.min_potential_score, logger)
-        all_accepted.extend(new_accepted)
-        logger.ok(
-            f"Runda {round_num}: +{len(new_accepted)} zaakceptowanych "
-            f"(lacznie {len(all_accepted)}/{target_accepted})"
-        )
+            products = filter_stock_and_rating(
+                products, config.min_stock, config.min_seller_rating, logger
+            )
+            stock_passed = {p.product_id for p in products}
+            for pid in delivery_passed - stock_passed:
+                cache.mark(pid, STATUS_REJECTED_STOCK)
+
+            if not products:
+                logger.warn(f"Runda {round_num}: wszystkie produkty odfiltrowane.")
+                continue
+
+            if _INTERRUPTED:
+                return 130
+
+            # Analiza Claude
+            products = analyzer.analyze_products(products)
+
+            if _INTERRUPTED:
+                return 130
+
+            new_accepted = filter_by_score(products, config.min_potential_score, logger)
+            accepted_ids = {p.product_id for p in new_accepted}
+            for p in products:
+                if p.product_id in accepted_ids:
+                    cache.mark(p.product_id, STATUS_ACCEPTED)
+                else:
+                    cache.mark(p.product_id, STATUS_REJECTED_CLAUDE)
+
+            all_accepted.extend(new_accepted)
+            logger.ok(
+                f"Runda {round_num}: +{len(new_accepted)} zaakceptowanych "
+                f"(lacznie {len(all_accepted)}/{target_accepted})"
+            )
+    finally:
+        if not args.no_cache:
+            cache.save()
+            logger.ok(f"Cache zapisany: {len(cache.get_all_ids())} ID -> {cache_path}")
 
     # Przytnij do dokladnego targetu
     accepted = all_accepted[:target_accepted]
