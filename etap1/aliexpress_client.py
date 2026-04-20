@@ -937,7 +937,14 @@ class AliExpressClient:
         for sku in sku_info_list:
             sku_price = float(sku.get("sku_price", 0) or 0)
             offer_price = float(sku.get("offer_sale_price", 0) or 0)
-            effective_price = offer_price if offer_price > 0 else sku_price
+            # Cena zakupu = minimum z obu — offer_sale_price moze byc wyzsza
+            # niz sku_price (np. po odliczeniu kuponu AliExpress)
+            if offer_price > 0 and sku_price > 0:
+                effective_price = min(offer_price, sku_price)
+            elif offer_price > 0:
+                effective_price = offer_price
+            else:
+                effective_price = sku_price
             sku_stock = int(sku.get("sku_available_stock", 0) or 0)
             sku_id = str(sku.get("sku_id", ""))
 
