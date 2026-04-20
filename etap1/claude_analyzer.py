@@ -24,7 +24,7 @@ from logger import Logger
 
 
 CLAUDE_MODEL: str = "claude-sonnet-4-20250514"
-BATCH_SIZE: int = 50
+BATCH_SIZE: int = 25
 MAX_OUTPUT_TOKENS: int = 16000
 
 
@@ -33,17 +33,17 @@ SYSTEM_PROMPT: str = """Jestes ekspertem e-commerce specjalizujacym sie w polski
 Twoja praca:
 - Oceniasz produkty z AliExpress pod katem sprzedazy w Polsce.
 - Znasz zasady SEO tytulow na Allegro: najwazniejsze slowa kluczowe na poczatku, konkretne parametry (rozmiar, kolor, moc, pojemnosc), bez "clickbaitu" i znakow specjalnych.
-- Piszesz po polsku, konkretnie, bez lania wody. Piszesz tak, jak pisza zwyciezcy rankingow Allegro.
-- Opisy formatujesz w bullet pointach zaczynajacych sie od "- " z konkretnymi zaletami, bez marketingowego belkotu.
+- Piszesz po polsku, konkretnie i naturalnie. Piszesz tak, jak pisza zwyciezcy rankingow Allegro.
 - Rozumiesz polskie kategorie Allegro (Elektronika, Dom i Ogrod, Motoryzacja, Sport i Turystyka, Uroda, Dla Dzieci, itd.).
 - Odrzucasz produkty niskiej jakosci: z chinglish w nazwach, bez konkretnych informacji, z podejrzanie niska cena, z informacjami "no return"/"use at own risk", z mala liczba zdjec (<2).
 
 Format odpowiedzi:
 - ZAWSZE zwracasz POPRAWNY JSON — tablice obiektow w kolejnosci dokladnie takiej samej jak w wejsciu.
-- Kazdy obiekt musi zawierac pola: index (int), title_pl (string, max 70 znakow), description_pl (string, max 500 znakow), category (string), potential_score (int 1-10), reject_reason (string, pusty jesli brak).
+- Kazdy obiekt musi zawierac pola: index (int), title_pl (string, max 70 znakow), description_pl (string, max 500 znakow, bullet pointy zaczynajace sie od "- "), description (string, 150-250 slow, pelny opis sprzedazowy), category (string), potential_score (int 1-10), reject_reason (string, pusty jesli brak).
 - Jesli produkt jest slaby jakosciowo: potential_score <= 5 i reject_reason z konkretnym uzasadnieniem.
 - NIE dodawaj tekstu poza JSON. NIE uzywaj code fence. Pierwszy znak odpowiedzi to '['.
-- Maksimum 70 znakow dla title_pl — licz znaki. Maksimum 500 znakow dla description_pl."""
+- Maksimum 70 znakow dla title_pl. Maksimum 500 znakow dla description_pl.
+- Pole "description": 150-250 slow, zaczyna sie od mocnego zdania sprzedazowego, opisuje glowne cechy i zalety, wspomina ze produkt jest wysylany z magazynu w EU (szybka dostawa do Polski zazwyczaj 3-7 dni), konczy sie wezwaniem do dzialania. Pisz naturalnie, bez chinglish, bez keyword stuffing."""
 
 
 class ClaudeAnalyzer:
@@ -99,6 +99,7 @@ class ClaudeAnalyzer:
             for product, result in zip(batch, results):
                 product.claude_title_pl = result.get("title_pl", "")[:70]
                 product.claude_description_pl = result.get("description_pl", "")[:500]
+                product.claude_long_description = result.get("description", "")
                 product.claude_category = result.get("category", "")
                 product.claude_potential_score = int(result.get("potential_score", 0) or 0)
                 product.claude_reject_reason = result.get("reject_reason", "") or ""
@@ -162,14 +163,20 @@ class ClaudeAnalyzer:
 Dla KAZDEGO produktu:
 1. Oceni potencjal sprzedazowy na polskim Allegro (1-10).
 2. Napisz nowy tytul po polsku, max 70 znakow, zoptymalizowany pod SEO Allegro (slowa kluczowe, parametry, bez clickbaitu).
-3. Napisz nowy opis po polsku, max 500 znakow, w formie bullet pointow zaczynajacych sie od "- ".
-4. Przypisz kategorie Allegro (np. "Elektronika > Akcesoria GSM > Uchwyty").
-5. Jesli produkt jest slabej jakosci (chinglish, podejrzanie niska cena, "no return", malo zdjec) — oceni <=5 i podaj reject_reason.
+3. Napisz krotki opis (description_pl) po polsku, max 500 znakow, w formie bullet pointow zaczynajacych sie od "- " z konkretnymi zaletami.
+4. Napisz pelny opis sprzedazowy (description) po polsku, 150-250 slow:
+   - Zacznij od mocnego zdania sprzedazowego (co to jest i dlaczego warto).
+   - Opisz glowne cechy i zalety produktu konkretnie i naturalnie.
+   - Wspomnij ze produkt jest wysylany z magazynu w Europie (szybka dostawa do Polski, zazwyczaj 3-7 dni roboczych).
+   - Zakoncz wezwaniem do dzialania (np. "Zamow teraz i otrzymaj...").
+   - Pisz naturalnie jak dobry copywriter — bez chinglish, bez keyword stuffing, bez "najlepszy produkt na swiecie".
+5. Przypisz kategorie Allegro (np. "Elektronika > Akcesoria GSM > Uchwyty").
+6. Jesli produkt jest slabej jakosci (chinglish, podejrzanie niska cena, "no return", malo zdjec) — oceni <=5 i podaj reject_reason.
 
 Wejscie:
 {input_json}
 
-Zwroc TYLKO tablice JSON (bez code fence, bez komentarzy) w tej samej kolejnosci co wejscie. Kazdy obiekt: index, title_pl, description_pl, category, potential_score, reject_reason."""
+Zwroc TYLKO tablice JSON (bez code fence, bez komentarzy) w tej samej kolejnosci co wejscie. Kazdy obiekt: index, title_pl, description_pl, description, category, potential_score, reject_reason."""
         return prompt
 
     def _parse_claude_response(
@@ -225,6 +232,7 @@ Zwroc TYLKO tablice JSON (bez code fence, bez komentarzy) w tej samej kolejnosci
                 item = {
                     "title_pl": "",
                     "description_pl": "",
+                    "description": "",
                     "category": "",
                     "potential_score": 0,
                     "reject_reason": "Claude nie zwrocil wyniku dla tego produktu",

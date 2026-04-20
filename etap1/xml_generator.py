@@ -96,6 +96,8 @@ def build_xml(
         _cdata(offer, "cat", category)
         _cdata(offer, "name", name)
         _cdata(offer, "desc", description)
+        if product.claude_long_description:
+            _cdata(offer, "description", product.claude_long_description)
 
         imgs = etree.SubElement(offer, "imgs")
         for idx, url in enumerate(product.images):

@@ -94,6 +94,7 @@ class Product:
     # Pola wypelniane przez Claude
     claude_title_pl: str = ""
     claude_description_pl: str = ""
+    claude_long_description: str = ""
     claude_category: str = ""
     claude_potential_score: int = 0
     claude_reject_reason: str = ""
